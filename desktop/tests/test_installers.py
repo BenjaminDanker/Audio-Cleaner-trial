@@ -1,5 +1,6 @@
 """What the installers are made of: the Inno Setup include and the Mac postinstall generated from the model
-catalog, the Mac distribution, and the catalog URL check. None of this needs Windows or a Mac."""
+catalog and the Mac distribution. None of this needs Windows or a Mac. (The check that every model a release carries
+can be found is test_release_models.py.)"""
 from __future__ import annotations
 
 import shutil
@@ -15,7 +16,6 @@ for sub in (PACKAGING, PACKAGING / "macos"):
     if str(sub) not in sys.path:
         sys.path.insert(0, str(sub))
 
-import check_model_urls  # noqa: E402
 import distribution  # noqa: E402
 import installer_models  # noqa: E402
 
@@ -267,34 +267,53 @@ def test_mac_welcome_text_names_the_download(tmp_path):
     xml.dom.minidom.parse(str(out / "distribution.xml"))
 
 
-def test_the_catalog_check_finds_missing_and_wrong_sized_files():
-    answers = {
-        "https://a/ok": [(200, {"content-length": "10"})],
-        "https://a/hf": [(302, {"x-linked-size": "20", "location": "https://cdn/x"}), (200, {"content-length": "20"})],
-        "https://a/gone": [(404, {})],
-        "https://a/small": [(302, {"location": "/next"}), (200, {"content-length": "5"})],
-    }
-    queue = {k: list(v) for k, v in answers.items()}
-    queue["https://a/next"] = queue["https://a/small"][1:]
-    queue["https://a/small"] = queue["https://a/small"][:1]
-    queue["https://cdn/x"] = answers["https://a/hf"][1:]
-    queue["https://a/hf"] = queue["https://a/hf"][:1]
+COPYRIGHT = "Copyright (c) 2025-2026 The Audio Cleaner authors"
+MIT_LICENSE = f"""MIT License
 
-    def head(url):
-        return queue[url].pop(0)
+{COPYRIGHT}
 
-    found = check_model_urls.problems(
-        [("https://a/ok", 10), ("https://a/hf", 20), ("https://a/gone", 1), ("https://a/small", 6)], head
-    )
-    assert len(found) == 2 and "HTTP 404" in found[0] and "5 bytes there, 6 in the catalog" in found[1]
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
 
 
-def test_every_catalog_download_is_checked_the_archive_once():
-    found = check_model_urls.catalog_files()
-    assert len(found) == len(resources.SPEECH_MODEL.files) + 1
-    assert (resources.MODELS_ARCHIVE.url, resources.MODELS_ARCHIVE.size) in found
-    assert not [url for url, _ in found if "ap-bwe" in url or "sidon_" in url or "48k.onnx" in url]  # no single files any more
-    assert all(url.startswith("https://") and size > 0 for url, size in found)
+def test_the_eula_is_the_mit_license_and_keeps_the_open_source_rights():
+    eula = (PACKAGING / "EULA.txt").read_text(encoding="utf-8")
+    assert eula.endswith(MIT_LICENSE)  # the full MIT License with our copyright line, word for word
+    assert "Permission is hereby granted, free of charge" in eula
+    eula = " ".join(eula.split())  # the prose is wrapped at fixed width
+    assert "FFmpeg (LGPL v2.1)" in eula and "Qt (LGPL v3)" in eula
+    for model in ("Whisper", "AP-BWE", "Sidon", "w2v-BERT 2.0"):  # the models setup downloads
+        assert model in eula, model
+    assert "replace the Qt or FFmpeg files with your own builds" in eula  # the LGPL right to swap the libraries
+    assert "checks the app's releases on GitHub for a newer version" in eula and "your IP address" in eula  # says what goes online
+    assert "from the app's releases on GitHub" in eula and "download server" not in eula  # where the models come from too
+    for restriction in ("may not", "reverse engineer", "decompile", "all rights reserved", "end this licence"):
+        assert restriction not in eula.lower(), restriction  # no terms on top of the MIT License
+
+
+def test_the_public_license_is_the_mit_license():
+    root = PACKAGING.parents[1]
+    # Here the public repository's LICENSE is the template; in the public repository it is the LICENSE at the top.
+    template = root / "tools" / "public-desktop" / "template" / "LICENSE"
+    assert (template if template.is_file() else root / "LICENSE").read_text(encoding="utf-8") == MIT_LICENSE
+    spec = (PACKAGING / "audio_cleaner.spec").read_text(encoding="utf-8")
+    assert f'"LegalCopyright", "{COPYRIGHT}"' in spec and f'"NSHumanReadableCopyright": "{COPYRIGHT}"' in spec
 
 
 # ---- running setup again over an installed app ---------------------------------------------------------------
