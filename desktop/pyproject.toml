@@ -1,0 +1,29 @@
+[project]
+name = "audio-cleaner-desktop"
+version = "2.0.0"
+description = "Audio Cleaner for desktop: remove background noise from video and audio files, offline"
+readme = "README.md"
+requires-python = ">=3.11"
+# acw-common (the cleaning pipeline shared with the server) is installed from ../common:
+#   pip install ../common
+dependencies = [
+  "numpy>=2",
+  "scipy>=1.13",
+  "pyloudnorm>=0.1",
+  "PySide6-Essentials>=6.7",
+  "PySide6-Addons>=6.7",  # QtMultimedia for the preview
+  "faster-whisper>=1.1",
+  "cryptography>=46",  # checks the signature of the update information (audio_cleaner_desktop/updater.py)
+]
+
+[project.gui-scripts]
+audio-cleaner = "audio_cleaner_desktop.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["audio_cleaner_desktop*"]
+
+[tool.setuptools.package-data]
+audio_cleaner_desktop = ["assets/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

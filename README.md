@@ -1,125 +1,76 @@
 # Audio Cleaner
 
-A cross‑platform desktop application that **removes background noise from any video’s audio track** using the
-[DeepFilterNet 3] neural noise‑suppression model and an intuitive **PyQt 6** interface.  
-It extracts the soundtrack, denoises it with DeepFilterNet, then remuxes the cleaned audio back into the
-original video with FFmpeg – all in one click.
+Audio Cleaner removes background noise from the voice in video and audio files, entirely on your own computer. Drop
+in a recording, pick how much cleaning you want, and get back the same file with the voice clear and the hiss, hum and
+room noise gone. It can also tidy up phone-quality recordings, take echo out, even out the loudness and write subtitles.
+Nothing you clean is uploaded.
 
----
+Windows 10/11 and macOS 14 or newer (Apple silicon and Intel) are supported.
 
-## Key Features
+## Download
 
-* **Point‑and‑click GUI** built with PyQt 6 – no command line needed.  
-* **Preview player** – play the source or cleaned video inside the app.  
-* Adjustable **attenuation limit slider** (1‑60 dB) or a safe recommended default.  
-* **Progress bar & status messages** courtesy of a background QThread worker.  
-* Automatic **remux** step strips problematic metadata (e.g. Sony *rtmd*) before processing.  
-* Works with **MP4, MOV, AVI, MKV** and any format FFmpeg can decode.  
-* Cross‑platform: Windows, macOS, Linux (tested on Python 3.9+).  
-* Clean shutdown & temp‑file cleanup even on errors.  
+The installers are in this repository's Releases: **https://github.com/BenjaminDanker/Audio-Cleaner/releases/latest**.
+Pick the Windows `.exe`, or the Mac `.pkg` for Apple silicon (M1 and newer) or for an Intel Mac.
 
----
+Setup downloads the larger models once (about 2.5 GB in all); after that everything works offline. The app checks for a
+newer version when it starts, and you can switch that off in Settings.
 
-## Quick Start
+## Old versions
 
-```bash
-# 1 – Clone this repository
-git clone https://github.com/your‑username/audio-cleaner.git
-cd audio-cleaner
+This repository used to hold a first version of the app, called VideoDenoiser. Its releases (v1.0.0 and v1.0.1) are
+still here and its source is still in the history under those tags. The app in this repository today is a complete
+rewrite of it, so the old settings and files do not carry over.
 
-# 2 – Create & activate a virtual environment (optional but recommended)
-python -m venv .venv
-source .venv/bin/activate   # On Windows: .venv\Scripts\activate
+## What is in here
 
-# 3 – Install dependencies
-pip install -r requirements.txt
+- `desktop/` the app: a Qt (PySide6) window around the cleaning code, plus the scripts that package it
+  (`desktop/packaging/`) and its tests
+- `common/` the cleaning code itself (`acw_common`): DeepFilterNet3 and DPDFNet noise removal, the polish chain,
+  FFmpeg handling, echo removal, restoring highs, subtitles
+- `native/deepfilter/` how the DeepFilterNet library (libDF) is built, with the one patch we apply to it
 
-# 4 – Download the DeepFilterNet 3 model (≈ 30 MB)
-python -m df --download-models
+The noise removal is [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) (MIT / Apache-2.0) and
+[DPDFNet](https://github.com/ceva-ip/DPDFNet) (Apache-2.0). FFmpeg is built from source without any GPL parts and linked
+statically. The licence notices of everything in the installers are in `desktop/packaging/licenses` and, once built, in
+the app's About box.
 
-# 5 – Run the app
-python deep.py
+## Running it from source
+
+You need Python 3.12 and, for the native pieces, a built libDF and FFmpeg (see below).
+
+```sh
+python3.12 -m venv .venv && . .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install --require-hashes -r desktop/requirements.lock -r desktop/requirements-build.lock
+export PYTHONPATH=desktop:common                           # Windows (cmd): set PYTHONPATH=desktop;common
+python -m audio_cleaner_desktop                            # the window
+python -m audio_cleaner_desktop --cli talk.mp4 -o out/     # no window; --help lists the options
+QT_QPA_PLATFORM=offscreen python -m pytest -q common/tests desktop/tests
 ```
 
-The first launch will prompt you to select an **input video** and a **save location**.  
-Click **“Denoise Video”** and let the progress bar reach 100 %. Voilà – background noise gone!
+Every Python package is pinned with the hashes of all its files (`desktop/packaging/hash_lock.py` regenerates the
+locks). From source the app reads the native pieces from `desktop/vendor/` (see `desktop/README.md`); tests that need
+them skip themselves when they are missing.
 
----
+## Building the installers
 
-## Requirements
+The installers in this repository's Releases are built from this code for each release: nothing is built in this
+repository itself. To build them yourself, here are the steps in order (each
+script starts with a comment that says how to run it):
 
-| Package | Tested Version | Notes |
-|---------|---------------|-------|
-| **Python** | 3.9 – 3.12 | |
-| [deepfilternet] | ≥ 0.4 |
-| **PyQt6** | ≥ 6.5 | GUI, multimedia widgets |
-| **moviepy** | ≥ 1.0 | Video I/O |
-| **soundfile** | ≥ 0.12 | WAV read/write |
-| **imageio‑ffmpeg** | ≥ 0.4 | FFmpeg binary download helper |
-| **Torch** |
-| **TorchAudio** |
+1. libDF: `native/deepfilter/build.sh native` (needs Rust; Git Bash on Windows)
+2. FFmpeg: `desktop/packaging/build_ffmpeg.sh <windows-x86_64|macos-arm64|macos-x86_64> <out_dir>`
+3. The heavy-noise model: `python desktop/packaging/fetch_dpdfnet.py build/dpdfnet`
+4. Everything the app bundles in one folder: `desktop/packaging/prepare_vendor.py` (it checks every file against its
+   pinned SHA-256 and writes the licence notices)
+5. `pyinstaller desktop/packaging/audio_cleaner.spec`, then `AudioCleaner --selftest --gui` on the result
+6. The installer: `desktop/packaging/windows/AudioCleaner.iss` (Inno Setup) or `desktop/packaging/macos/make_pkg.sh`
 
-A pre‑filled **`requirements.txt`** is provided for your convenience.
+`desktop/packaging/build_windows.ps1` and `desktop/packaging/build_macos.sh` chain these steps on a Windows PC or a Mac.
 
----
+## Questions and problems
 
-## How It Works
+Questions are welcome through the contact form at https://mc-multi-world.space/audio/contact. Issues here are welcome
+too, for problems in the code or the build.
 
-```text
-           ┌────────────┐ 1. Extract audio with MoviePy
-Input MP4 ─► Remux step ├──────────┐
-           └────────────┘          │
-                                   ▼
-                            2. Denoise WAV
-                               with DF‑Net
-                                   ▼
-           ┌────────────┐ 3. Combine audio & video with FFmpeg
-Clean MP4 ◄─┤  FFmpeg   │
-           └────────────┘
-```
-
-The heavy lifting is done in `DenoiseWorker` (see **deep.py**) running in its own
-QThread so the UI stays responsive.
-
----
-
-## Packaging a Standalone Executable *(optional)*
-
-Install PyInstaller, then:
-
-```bash
-pyinstaller --noconfirm --windowed --onefile \
-  --add-data "models/DeepFilterNet3:models/DeepFilterNet3" \
-  --add-binary "$(python - <<'PY'
-import imageio_ffmpeg, sys, os; print(imageio_ffmpeg.get_ffmpeg_exe()+os.pathsep+'ffmpeg')
-PY)":. \
-  deep.py
-```
-
-The resulting **`dist/deep`** (or **`deep.exe`** on Windows) can be shipped
-without requiring Python on the end‑user’s machine.
-
----
-
-## Troubleshooting
-
-| Symptom | Possible Cause / Fix |
-|---------|----------------------|
-| **“Core dependencies missing”** in status bar | `pip install -r requirements.txt` |
-| No audio in output | Set console=true in VideoDenoiser.spec when creating an executable |
-| **FFmpeg executable not found** | `pip install imageio‑ffmpeg` or add FFmpeg to PATH. |
-| Crash when loading video | Some raw camera files have invalid edit lists – the built‑in *remux* step usually fixes this. |
-
----
-
-## License
-
-Distributed under the **MIT License** – see [`LICENSE`](LICENSE) for details.
-
----
-
-## Acknowledgements
-
-* [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) by **A. Rosenkranz et al.**
-* [MoviePy](https://zulko.github.io/moviepy/) – video editing in Python  
-* **FFmpeg** – the Swiss‑Army knife of video processing
+This repository is updated in whole snapshots, so a pull request cannot be merged here as it is; if you have a fix,
+open an issue that describes it and it will be applied.

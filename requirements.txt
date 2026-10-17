@@ -1,7 +1,0 @@
-imageio_ffmpeg
-pyqt6
-soundfile
-deepfilternet
-moviepy
-torch
-torchaudio
