@@ -5,26 +5,29 @@
     python installer_models.py --mac SCRIPTS_DIR      macOS: the .pkg's preinstall and postinstall scripts (make_pkg.sh)
     python installer_models.py --total-gb             size of all the downloads in GB (for the texts)
 
-Generated from the app's own catalog (resources.SPEECH_MODEL, HIGHS_MODEL, VOICE_MODEL; read without importing
+Generated from the app's own catalog (resources.NOISE_MODEL, SPEECH_MODEL, HIGHS_MODEL, VOICE_MODEL; read without importing
 numpy, so a bare python3 is enough), so the installer and the app always agree on URLs, sizes and SHA-256.
 
-The speech model comes as individual files: the installer checks every file's SHA-256 (Inno Setup's download page
-does) and installs it into {app}\\models\\<id>\\, where the app looks (models.location). The two ONNX models (restoring
-highs, rebuilding the voice) come in ONE zip archive (resources.MODELS_ARCHIVE): setup downloads it once (SHA-256
-checked), unpacks it with Windows' own tar.exe (Windows 10 1803 and later; without it setup leaves the models to
-the app's Settings), moves each file to its model's folder after checking its size, puts the archive's LICENSES
-folder next to the models, and deletes the archive. Files that a previous install already put there with the right
-size are not fetched again, so updating the app does not download 2.5 GB each time. A model whose files are all
-there gets a .complete marker with the hashes of its files, which the app compares with its catalog
-(models.location). On a Mac the .pkg's postinstall script does the same into
-/Library/Application Support/Audio Cleaner/models/<id>/ (models.installer_dir), unpacking with ditto. If a download
-fails (offline), setup still finishes; the app then offers the missing download in Settings.
+Every model comes as individual files from Hugging Face (config.hf_models_url, pinned by revision): the installer
+checks every file's SHA-256 (Inno Setup's download page does) and installs it into {app}\\models\\<id>\\, where the
+app looks (models.location). A model's licence texts (SpeechModel.licences, LICENSES/<name> in its folder) are
+downloaded the same way, but are not part of the .complete marker: they do not make a model complete or outdated.
+Files that a previous install already put there with the right size are not fetched again, so updating the app
+does not download 2.5 GB each time. A model whose files are all there gets a .complete marker with the hashes of its
+files, which the app compares with its catalog (models.location). On a Mac the .pkg's postinstall script does the
+same into /Library/Application Support/Audio Cleaner/models/<id>/ (models.installer_dir). If a download fails
+(offline), setup still finishes; the app then offers the missing download (Settings; the noise models at start-up).
+
+The noise removal models are REQUIRED (SpeechModel.required; they are what the app is for, 23 MB, first in the list):
+setup does not finish silently without them. Windows: after the files are installed a message says they are missing
+and that the app offers the download (logged too, for silent installs); a Mac: the same message as a dialog in the
+installing user's session (best effort) and in /var/log/audio-cleaner-install.log. Installing still succeeds so the
+app is there to retry from. Models that are not required only get the short "finish it in Settings" message.
 
 Running setup again over an installed app (same or newer version) downloads nothing that is already complete: a model
 whose files are all there with the right sizes is left alone (and its marker rewritten); a marker that names other
 hashes than this catalog (a model of another version) makes setup forget that model's files and fetch it again; a
-partial earlier install is completed (individual files one by one, the archive again if any of its files is missing
-or has the wrong size). Nothing in the models folder is ever deleted otherwise.
+partial earlier install is completed file by file. Nothing in the models folder is ever deleted otherwise.
 """
 from __future__ import annotations
 
@@ -35,9 +38,8 @@ sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).res
 
 from audio_cleaner_desktop import models, resources  # noqa: E402
 
-CATALOG = (resources.SPEECH_MODEL, resources.HIGHS_MODEL, resources.VOICE_MODEL)
+CATALOG = (resources.NOISE_MODEL, resources.SPEECH_MODEL, resources.HIGHS_MODEL, resources.VOICE_MODEL)
 BS = chr(92)
-ARCHIVE_TMP = "acw-models.zip"  # the archive's name in setup's temporary folder
 
 
 def _pascal(text: str) -> str:
@@ -49,38 +51,23 @@ def _app_path(m, f) -> str:
     return "{app}" + BS + "models" + BS + m.id + BS + f.path.replace("/", BS)
 
 
-def _archive(catalog):
-    """The one archive the catalog's models share (None when there is none)."""
-    found = {m.archive for m in catalog if m.archive is not None}
-    if len(found) > 1:
-        raise ValueError("the installers handle one models archive")
-    return next(iter(found), None)
-
-
 def _plain(catalog):
-    """(model, file) of everything that is downloaded as an individual file."""
-    return [(m, f) for m in catalog if m.archive is None for f in m.files]
-
-
-def _archived(catalog):
-    """(model, file) of everything that comes out of the archive."""
-    return [(m, f) for m in catalog if m.archive is not None for f in m.files]
+    """(model, file) of everything that is downloaded: the models' files, then their licence texts."""
+    return [(m, f) for m in catalog for f in (*m.files, *m.licences)]
 
 
 def total_bytes(catalog=CATALOG) -> int:
-    """Everything setup downloads: the individual files and the archive (once)."""
-    return models.download_bytes(catalog)
+    """Everything setup downloads."""
+    return sum(f.size for _, f in _plain(catalog))
 
 
 def model_names() -> str:
     """The models in words, for the texts the installers show."""
-    return "subtitles, phone-quality recordings and rebuilding voices"
+    return "noise removal, subtitles, phone-quality recordings and rebuilding voices"
 
 
 def render(catalog=CATALOG) -> str:
-    archive = _archive(catalog)
     plain = _plain(catalog)
-    archived = _archived(catalog)
     total = total_bytes(catalog)
     files = []
     fetches = []
@@ -111,133 +98,25 @@ def render(catalog=CATALOG) -> str:
         hashes = "#10".join(_pascal(f.sha256) for f in m.files)
         marker = _pascal("{app}" + BS + "models" + BS + m.id + BS + ".complete")
         markers.append(f"  if {ready} then\n    SaveStringToFile(ExpandConstant({marker}), {hashes}, False);")
+    tmp_names = {(m.id, f.path): f"acw-model-{n}" for n, (m, f) in enumerate(plain)}
+    required = [(m, f) for m in catalog if m.required for f in m.files]
+    installed_missing = "\n".join(
+        f"  if not ModelFileReady(ExpandConstant({_pascal(_app_path(m, f))}), {f.size}) then Result := True;"
+        for m, f in required
+    ) or "  Result := False;"
+    download_missing = "\n".join(
+        f"  if not (ModelFileReady(ExpandConstant({_pascal(_app_path(m, f))}), {f.size}) or "
+        f"ModelFileReady(ExpandConstant({_pascal('{tmp}' + BS + tmp_names[(m.id, f.path)])}), {f.size})) then Result := True;"
+        for m, f in required
+    ) or "  Result := False;"
+    required_mb = sum(m.size for m in catalog if m.required) / 1e6
     needed = chr(10).join(
         f"  if not ModelFileReady(ExpandConstant({_pascal(_app_path(m, f))}), {f.size}) then Result := Result + {f.size};"
         for m, f in plain
     )
-    setup_extra = ""
-    archive_code = ""
-    archive_fetch = ""
-    archive_step = ""
-    need_lines = ["  Result := 0;", needed]
-    if archive is not None:
-        unpacked = sum(f.size for _, f in archived) + archive.unpacked_size
-        setup_extra = (
-            "[Setup]\n; The models unpacked from the archive. The archive itself waits in the temporary folder.\n"
-            f"ExtraDiskSpaceRequired={unpacked}\n\n"
-        )
-        missing = chr(10).join(
-            f"  if not ModelFileReady(ExpandConstant({_pascal(_app_path(m, f))}), {f.size}) then Result := True;"
-            for m, f in archived
-        )
-        places = [
-            f"    PlaceModelFile(Work + {_pascal(BS + f.member.replace('/', BS))}, ExpandConstant({_pascal(_app_path(m, f))}), {f.size});"
-            for m, f in archived
-        ] + [
-            "    PlaceModelFile(Work + " + _pascal(BS + f.member.replace("/", BS)) + ", ExpandConstant("
-            + _pascal("{app}" + BS + "models" + BS + f.path.replace("/", BS)) + f"), {f.size});"
-            for f in archive.shared
-        ]
-        need_lines.append(f"  if ArchiveNeeded then Result := Result + {archive.size};")
-        archive_code = f"""
-{{ True when a file that comes out of the models archive is not installed yet. }}
-function ArchiveNeeded: Boolean;
-begin
-  Result := False;
-{missing}
-end;
-
-{{ Windows' own tar.exe (Windows 10 1803 and later) unpacks zip files. Not the first tar on the PATH: that may be a GNU tar
-  that cannot read a drive letter. }}
-function TarPath: String;
-begin
-  Result := ExpandConstant('{{win}}\\System32\\tar.exe');
-  if not FileExists(Result) then
-    Result := ExpandConstant('{{win}}\\Sysnative\\tar.exe');
-  if not FileExists(Result) then
-    Result := '';
-end;
-
-procedure FetchArchive;
-begin
-  if ModelsCancelled or not ArchiveNeeded then
-    Exit;
-  if TarPath = '' then
-  begin
-    ModelsFailed := ModelsFailed + 1;
-    Log('tar.exe is not available: the models archive was not downloaded');
-    Exit;
-  end;
-  ModelDownloads.Clear;
-  ModelDownloads.Add({_pascal(archive.url)}, {_pascal(ARCHIVE_TMP)}, {_pascal(archive.sha256)});
-  try
-    ModelDownloads.Download;
-    ArchiveDownloaded := True;
-  except
-    if ModelDownloads.AbortedByUser then
-      ModelsCancelled := True
-    else
-    begin
-      ModelsFailed := ModelsFailed + 1;
-      Log('Could not download {archive.url}: ' + GetExceptionMessage);
-    end;
-  end;
-end;
-
-{{ Move one unpacked file to where the app looks for it, after checking its size. }}
-procedure PlaceModelFile(const Src, Dest: String; Size: Int64);
-begin
-  if ModelFileReady(Dest, Size) then
-    Exit;
-  if not ModelFileReady(Src, Size) then
-  begin
-    Log('Not unpacked correctly: ' + Src);
-    ModelsFailed := ModelsFailed + 1;
-    Exit;
-  end;
-  ForceDirectories(ExtractFilePath(Dest));
-  DeleteFile(Dest);
-  if not RenameFile(Src, Dest) then
-  begin
-    Log('Could not move ' + Src + ' to ' + Dest);
-    ModelsFailed := ModelsFailed + 1;
-  end;
-end;
-
-procedure UnpackModels;
-var
-  Zip, Work: String;
-  Code, FailedBefore: Integer;
-begin
-  if not ArchiveDownloaded then
-    Exit;
-  FailedBefore := ModelsFailed;
-  Zip := ExpandConstant({_pascal("{tmp}" + BS + ARCHIVE_TMP)});
-  Work := ExpandConstant('{{app}}\\models\\.unpack');
-  DelTree(Work, True, True, True);
-  ForceDirectories(Work);
-  WizardForm.StatusLabel.Caption := 'Unpacking the models...';
-  if Exec(TarPath, '-xf "' + Zip + '" -C "' + Work + '"', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0) then
-  begin
-{chr(10).join(places)}
-  end
-  else
-  begin
-    ModelsFailed := ModelsFailed + 1;
-    Log('tar.exe could not unpack the models archive (exit code ' + IntToStr(Code) + ')');
-  end;
-  DelTree(Work, True, True, True);
-  DeleteFile(Zip);
-  if ModelsFailed > FailedBefore then
-    SuppressibleMsgBox('Not every model could be unpacked. Setup will finish without them. '
-      + 'Open Audio Cleaner > Settings to finish the download.', mbInformation, MB_OK, IDOK);
-end;
-"""
-        archive_fetch = "    FetchArchive;\n"
-        archive_step = "  UnpackModels;\n"
     return f"""; Generated by desktop/packaging/installer_models.py: do not edit by hand.
 
-{setup_extra}[Files]
+[Files]
 {chr(10).join(files)}
 
 [UninstallDelete]
@@ -248,7 +127,6 @@ var
   ModelDownloads: TDownloadWizardPage;
   ModelsFailed: Integer;
   ModelsCancelled: Boolean;
-  ArchiveDownloaded: Boolean;
 
 function ModelFileReady(const Path: String; Size: Int64): Boolean;
 var
@@ -308,10 +186,25 @@ begin
     end;
   end;
 end;
-{archive_code}
+
 function ModelsStillNeeded: Int64;
 begin
-{chr(10).join(need_lines)}
+  Result := 0;
+{needed}
+end;
+
+{{ The required models (noise removal) are missing: not installed, and not downloaded to the temporary folder either. }}
+function RequiredDownloadMissing: Boolean;
+begin
+  Result := False;
+{download_missing}
+end;
+
+{{ The required models are not in the program folder (checked after the files were installed). }}
+function RequiredInstalledMissing: Boolean;
+begin
+  Result := False;
+{installed_missing}
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -330,20 +223,22 @@ begin
   begin
     SuppressibleMsgBox('There is not enough free space on the drive for temporary files to download the models ('
       + Format('%.1f', [Need / 1.0e9]) + ' GB needed, ' + Format('%.1f', [Free / 1.0e9]) + ' GB free). '
-      + 'Setup will finish without them. Free up some space, then open Audio Cleaner > Settings to download them.',
+      + 'Setup will finish without them. Free up some space, then open Audio Cleaner to download them '
+      + '(it offers the noise removal models on its main screen, the others are in Settings).',
       mbInformation, MB_OK, IDOK);
     Exit;
   end;
   ModelsFailed := 0;
   ModelsCancelled := False;
-  ArchiveDownloaded := False;
   ModelDownloads.Show;
   try
-{archive_fetch}{chr(10).join(fetches)}
+{chr(10).join(fetches)}
   finally
     ModelDownloads.Hide;
   end;
-  if ModelsCancelled then
+  if RequiredDownloadMissing then
+    Log('The required noise removal models were not downloaded; the message after the installation says so.')
+  else if ModelsCancelled then
     SuppressibleMsgBox('The download of the models was cancelled. Setup will finish without them. '
       + 'Open Audio Cleaner > Settings to download them later.', mbInformation, MB_OK, IDOK)
   else if ModelsFailed > 0 then
@@ -351,12 +246,21 @@ begin
       + 'Open Audio Cleaner > Settings to finish the download.', mbInformation, MB_OK, IDOK);
 end;
 
-{{ A model counts as installed only when all its files are there; this marker says which version of it. }}
+{{ A model counts as installed only when all its files are there; this marker says which version of it. The noise
+  removal models are required: when they are still missing, say so (setup does not end silently without them). The
+  app is installed anyway and offers the download on its main screen, so there is something to retry from. }}
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep <> ssPostInstall then
     Exit;
-{archive_step}{chr(10).join(markers)}
+{chr(10).join(markers)}
+  if RequiredInstalledMissing then
+  begin
+    Log('The required noise removal models are not installed.');
+    SuppressibleMsgBox('The noise removal models ({required_mb:.0f} MB) could not be downloaded, so Audio Cleaner cannot clean '
+      + 'recordings yet. It is installed: when you open it, it offers the download (one click, needs the internet). '
+      + 'The other models can be downloaded in Settings.', mbError, MB_OK, IDOK);
+  end;
 end;
 """
 
@@ -366,7 +270,6 @@ APP_BUNDLE = "Audio Cleaner.app"
 
 
 def render_mac(catalog=CATALOG) -> str:
-    archive = _archive(catalog)
     fetches = [f'fetch "{f.url}" "{MAC_MODELS}/{m.id}/{f.path}" {f.size} {f.sha256}' for m, f in _plain(catalog)]
     finishes = []
     forgets = []
@@ -374,45 +277,18 @@ def render_mac(catalog=CATALOG) -> str:
         specs = " ".join(f'"{f.sha256}:{f.size}:{f.path}"' for f in m.files)
         finishes.append(f'finish "{MAC_MODELS}/{m.id}" {specs}')
         forgets.append(f'forget_stale "{MAC_MODELS}/{m.id}" {specs}')
-    archive_block = ""
-    if archive is not None:
-        archived = _archived(catalog)
-        checks = "\n".join(f'have "{MAC_MODELS}/{m.id}/{f.path}" {f.size} || need_archive=1' for m, f in archived)
-        places = "\n".join(
-            f'      place "$WORK/{f.member}" "{MAC_MODELS}/{m.id}/{f.path}" {f.size}' for m, f in archived
-        ) + "\n" + "\n".join(f'      place "$WORK/{f.member}" "{MAC_MODELS}/{f.path}" {f.size}' for f in archive.shared)
-        archive_block = f"""
-# The ONNX models and their licence texts come in one archive: download it once, check its SHA-256, unpack it
-# with ditto into a work folder, move every file to its model's folder after checking its size, delete the archive.
-ARCHIVE="{MAC_MODELS}/.{archive.name}.download"
-WORK="{MAC_MODELS}/.unpack"
-need_archive=0
-{checks}
-if [ "$need_archive" = 1 ]; then
-  mkdir -p "{MAC_MODELS}"
-  rm -f "$ARCHIVE"
-  if curl -fL --proto '=https' --retry 3 --connect-timeout 30 --speed-limit 1000 --speed-time 60 --max-time 3600 -C - \\
-       -o "$ARCHIVE" "{archive.url}" >>"$LOG" 2>&1 \\
-     && [ "$(shasum -a 256 "$ARCHIVE" | cut -d' ' -f1)" = "{archive.sha256}" ]; then
-    rm -rf "$WORK"; mkdir -p "$WORK"
-    if ditto -x -k "$ARCHIVE" "$WORK" >>"$LOG" 2>&1 || /usr/bin/unzip -q -o "$ARCHIVE" -d "$WORK" >>"$LOG" 2>&1; then
-{places}
-    else
-      echo "could not unpack {archive.name}" >>"$LOG"; failed=1
-    fi
-  else
-    echo "could not download {archive.url}" >>"$LOG"; failed=1
-  fi
-  rm -rf "$WORK" "$ARCHIVE"
-fi
-"""
     total = total_bytes(catalog)
+    required = [f'"{f.size}:{MAC_MODELS}/{m.id}/{f.path}"' for m in catalog if m.required for f in m.files]
+    required_mb = sum(m.size for m in catalog if m.required) / 1e6
     return f"""#!/bin/bash
 # postinstall of the Audio Cleaner .pkg: download the models ({total / 1e9:.1f} GB, once).
 # Generated by desktop/packaging/installer_models.py: do not edit by hand. Runs as root during setup.
 # Every download is checked against its SHA-256 before it is used; files already there with the right
 # size are kept (updates do not download again). A failed download does not fail the installation: the app
 # offers it again in Settings. A model that is complete gets a .complete marker (the hashes of its files).
+# The noise removal models are REQUIRED: when they are still missing at the end, a dialog in the installing user's session
+# says so (best effort: there is none for a command-line install) and the log has the same line; the app is installed anyway
+# and offers the download on its main screen.
 LOG=/var/log/audio-cleaner-install.log
 failed=0
 have() {{  # have FILE SIZE: the file is there with that size
@@ -429,15 +305,6 @@ fetch() {{
     mv -f "$tmp" "$dest"; chmod 644 "$dest"
   else
     rm -f "$tmp"; echo "could not download $url" >>"$LOG"; failed=1
-  fi
-}}
-place() {{  # place SRC DEST SIZE: move an unpacked file to its place when it has the right size
-  local src="$1" dest="$2" size="$3"
-  if have "$dest" "$size"; then return 0; fi
-  if have "$src" "$size"; then
-    mkdir -p "$(dirname "$dest")"; mv -f "$src" "$dest"; chmod 644 "$dest"
-  else
-    echo "not unpacked correctly: $src" >>"$LOG"; failed=1
   fi
 }}
 forget_stale() {{  # forget_stale DIR SHA:SIZE:PATH...  a .complete marker naming other hashes: another version's files go
@@ -461,9 +328,21 @@ finish() {{  # finish DIR SHA:SIZE:PATH...  writes DIR/.complete when every file
 }}
 {chr(10).join(forgets)}
 {chr(10).join(fetches)}
-{archive_block}{chr(10).join(finishes)}
+{chr(10).join(finishes)}
 chmod -R a+rX "{MAC_MODELS}" 2>/dev/null
 [ "$failed" = 0 ] || echo "some models are missing; Audio Cleaner offers them in Settings" >>"$LOG"
+required_missing=0
+for spec in {" ".join(required) or '""'}; do
+  [ -n "$spec" ] || continue
+  have "${{spec#*:}}" "${{spec%%:*}}" || required_missing=1
+done
+if [ "$required_missing" = 1 ]; then
+  echo "the required noise removal models are not installed; Audio Cleaner offers the download on its main screen" >>"$LOG"
+  user="$(stat -f%Su /dev/console 2>/dev/null)"
+  if [ -n "$user" ] && [ "$user" != root ]; then
+    launchctl asuser "$(id -u "$user")" osascript -e 'display dialog "The noise removal models ({required_mb:.0f} MB) could not be downloaded, so Audio Cleaner cannot clean recordings yet. It is installed: when you open it, it offers the download (one click, needs the internet)." with title "Audio Cleaner" buttons {{"OK"}} default button "OK" with icon caution giving up after 300' >>"$LOG" 2>&1 || true
+  fi
+fi
 exit 0
 """
 

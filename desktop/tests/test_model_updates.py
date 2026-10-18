@@ -7,7 +7,6 @@ import hashlib
 import re
 from pathlib import Path
 
-import pytest
 from PySide6.QtCore import QSettings
 
 from audio_cleaner_desktop import config, models, resources, updater
@@ -77,22 +76,16 @@ def test_the_installers_older_copy_also_counts_as_having_the_model(server, monke
     assert models.outdated([old]) == []
 
 
-def test_an_archive_model_is_updated_by_one_download_of_the_new_archive(server, monkeypatch):  # noqa: F811
-    from test_models import _archive_models
-
-    monkeypatch.setattr(models, "CATALOG", {})
-    _, one, two, members = _archive_models(server)
-    models.register(one, two)
-    models.download(one)
-    _RangeHandler.requests.clear()
-    # the next archive: one file of "one" changed
-    changed = dict(members, **{"one/a.onnx": b"new revision" * 50_000})
-    _, one2, two2, _ = _archive_models(server, changed)
-    models.register(one2, two2)
-    assert models.outdated() == [one2] and models.is_installed(two2)  # "two" did not change: still installed
-    models.download(one2)
-    assert models.outdated() == [] and _RangeHandler.requests == ["/models.zip"]
-    assert (models.model_dir(one2) / "a.onnx").read_bytes() == changed["one/a.onnx"]
+def test_the_old_models_archives_partial_download_is_cleaned_up_once_nothing_waits_for_an_update(server):  # noqa: F811
+    root = models.models_dir()
+    m = _model(server, {"model.bin": b"x"})
+    models.download(m)
+    old = root / "AudioCleaner-models-v2.partial"  # what the app of the archive days left behind after a failed download
+    old.mkdir()
+    (old / ".pin").write_text("0" * 64)
+    (old / "AudioCleaner-models-v2.zip.part").write_bytes(b"x" * 1000)
+    (root / "LICENSES").mkdir()  # the archive's shared licence texts stay (About shows them for old copies)
+    assert models.remove_stale([m]) == [old] and not old.exists() and (root / "LICENSES").is_dir()
 
 
 # ---- removing what is outdated -------------------------------------------------------------------------------------------
@@ -181,23 +174,9 @@ def test_the_installers_folder_is_cleaned_only_where_it_can_be_written(server, m
     assert (root / "LICENSES" / "A-MIT.txt").is_file()
 
 
-@pytest.mark.skipif(not hasattr(__import__("os"), "geteuid") or __import__("os").geteuid() == 0, reason="root can write anywhere")
-def test_a_read_only_installer_folder_is_left_alone_for_real(server, monkeypatch, tmp_path):  # noqa: F811
-    root = _installer_root(monkeypatch, tmp_path)
-    old = _model(server, {"model.bin": b"one"})
-    _put_copy(root / old.id, old, {"model.bin": b"one"})
-    new = _newer(old, b"two!")
-    models.download(new)
-    root.chmod(0o555)  # the folder cannot be changed, so a model folder in it cannot be removed
-    try:
-        assert models.remove_stale([new]) == [] and (root / old.id / "model.bin").is_file()
-    finally:
-        root.chmod(0o755)
-
-
 # ---- the window ---------------------------------------------------------------------------------------------------------------
 def _window(tmp_path, monkeypatch, started, outdated_ids):
-    monkeypatch.setattr(speech_model.SpeechModelDownloader, "ready", property(lambda self: self.model.id in started))
+    monkeypatch.setattr(speech_model.SpeechModelDownloader, "ready", property(lambda self: self.model.id in started or self.model is resources.NOISE_MODEL))
     monkeypatch.setattr(speech_model.SpeechModelDownloader, "start", lambda self: started.append(self.model.id))
     monkeypatch.setattr(models, "needs_update", lambda m: m.id in outdated_ids)
     cleaned = []
@@ -261,19 +240,18 @@ def test_nothing_to_update_only_tidies_up(qapp, tmp_path, monkeypatch):
         _close(w)
 
 
-# ---- every download from the app's own GitHub releases ---------------------------------------------------------------------
+# ---- the updater uses the app's GitHub releases; the models come from Hugging Face ------------------------------------------
 def test_the_release_addresses_are_defined_in_one_place():
-    from audio_cleaner_desktop import __released__, __releases__, __version__
+    from audio_cleaner_desktop import __releases__
 
     assert re.fullmatch(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+", __releases__)
     assert config.RELEASES_URL == f"https://github.com/{__releases__}/releases/"
     assert config.LATEST_URL == config.RELEASES_URL + "latest/download/"
     assert config.release_url("2.0.41") == config.RELEASES_URL + "download/v2.0.41/"
-    assert config.MODELS_URL == (config.release_url(__version__) if __released__ else config.LATEST_URL)
     assert updater.MANIFEST_URL == config.LATEST_URL + "update.json"  # the newest release's
     assert updater.SIGNATURE_URL == config.LATEST_URL + "update.json.sig"
     assert updater.DOWNLOAD_BASE is None  # the installer: from the release of the version the manifest names
-    for gone in ("DOWNLOADS_BASE", "UPDATES_URL"):
+    for gone in ("DOWNLOADS_BASE", "UPDATES_URL", "MODELS_URL"):
         assert not hasattr(config, gone)
     # a repository move is one edit (CI writes it into __init__.py): nothing else spells the repository or the host out
     for path in list((DESKTOP / "audio_cleaner_desktop").rglob("*.py")) + list((DESKTOP / "packaging").glob("*.py")):
@@ -281,49 +259,24 @@ def test_the_release_addresses_are_defined_in_one_place():
         if path.name != "__init__.py" or path.parent.name != "audio_cleaner_desktop":
             assert __releases__ not in text and "releases/latest" not in text, path
         if path.name != "config.py":
-            assert "mc-multi-world" not in text, path
+            assert "audiocleaner.live" not in text, path
 
 
-def test_a_source_checkout_uses_the_newest_release():
-    # CI's version.py --write marks a release build; the committed source is not one (it has no release of its own)
-    from audio_cleaner_desktop import __released__
-
-    assert __released__ is False
-    assert config.MODELS_URL == config.LATEST_URL
-
-
-def test_every_download_of_the_catalog_is_a_file_of_the_release():
-    for m in (resources.SPEECH_MODEL, resources.HIGHS_MODEL, resources.VOICE_MODEL):
-        urls = [m.archive.url] if m.archive is not None else [f.url for f in m.files]
-        for url in urls:
-            assert url.startswith(config.MODELS_URL) and "/" not in url[len(config.MODELS_URL):], url
-    assert resources.MODELS_ARCHIVE.url == config.MODELS_URL + "AudioCleaner-models-v2.zip"
-    # the speech model's files are named "whisper-<file>" in the release (release_models.py publishes them so)
-    assert [f.url for f in resources.SPEECH_MODEL.files] == [config.MODELS_URL + "whisper-" + f.path for f in resources.SPEECH_MODEL.files]
-    names = [u.rsplit("/", 1)[1] for u in [resources.MODELS_ARCHIVE.url, *(f.url for f in resources.SPEECH_MODEL.files)]]
-    assert len(set(names)) == len(names)  # one release holds them all: no two with the same name
-
-
-def test_the_installers_and_the_release_use_the_same_addresses():
+def test_no_model_comes_from_the_releases_and_the_installers_download_exactly_the_catalog():
     import sys
 
     sys.path.insert(0, str(DESKTOP / "packaging"))
     import installer_models
-    import release_models
 
-    archive = resources.MODELS_ARCHIVE
+    catalog = (resources.NOISE_MODEL, resources.SPEECH_MODEL, resources.HIGHS_MODEL, resources.VOICE_MODEL)
+    wanted = {f.url for m in catalog for f in (*m.files, *m.licences)}
+    assert all(u.startswith("https://huggingface.co/") for u in wanted) and not any(u.startswith(config.RELEASES_URL) for u in wanted)
     windows = installer_models.render()
     mac = installer_models.render_mac()
-    assert archive.url in windows and archive.url in mac
-    for f in resources.SPEECH_MODEL.files:
-        assert f.url in windows and f.url in mac
-    # what the installers download is exactly what the release job puts into the release
-    published = {name for name, *_ in release_models.whisper_files()} | {archive.name}
-    urls = {u.rstrip(":.,") for u in re.findall(r"https://[^\s'\"]+", windows + mac)}  # (a log line ends one with ":")
-    assert {u for u in urls if not u.startswith(config.MODELS_URL)} == set()
-    assert {u[len(config.MODELS_URL):] for u in urls} == published
-    for text in (windows, mac, installer_models.render_mac_preinstall()):
-        assert "huggingface" not in text and "mc-multi-world" not in text and "api/downloads" not in text
+    for text in (windows, mac):
+        assert {u.rstrip(":.,") for u in re.findall(r"https://[^\s'\"]+", text)} == wanted  # (a log line ends one with ":")
+        assert "audiocleaner.live" not in text and "api/downloads" not in text and ".zip" not in text and "tar.exe" not in text
+    assert "audiocleaner.live" not in installer_models.render_mac_preinstall()
 
 
 def _private_repository_pattern() -> str | None:

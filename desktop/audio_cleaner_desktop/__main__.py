@@ -4,7 +4,13 @@ import argparse
 import os
 import sys
 
-from . import quiet_popen
+# numpy's own thread pool (OpenBLAS/OpenMP/MKL) would only waste CPU next to the app's explicitly threaded work
+# (onnxruntime, CTranslate2 and libDF get their thread counts passed in): one thread, set before numpy is imported
+# (the engine import below pulls it in). An explicit setting by the user still wins.
+for _name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_name, "1")
+
+from . import quiet_popen  # noqa: E402
 
 quiet_popen.install()  # first, before the heavier imports below (the frozen app does this in packaging/launcher.py)
 
@@ -29,14 +35,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gui", action="store_true", help="with --selftest: also build the window, the preview and the About box")
     p.add_argument(
         "--download-models", "--download-speech-model", action="store_true", dest="download_models",
-        help="download the models for subtitles, restoring highs and rebuilding the voice (about 2.5 GB, once) and exit",
+        help="download the models for noise removal, subtitles, restoring highs and rebuilding the voice (about 2.6 GB, once) and exit",
     )
     p.add_argument("-o", "--output-dir", metavar="OUTDIR", help="write results here (default: next to each original)")
     p.add_argument(
         "--strength", choices=list(STRENGTH_CHOICES), default=AUTO_STRENGTH,
         help="noise reduction strength; auto (default) picks the one that fits each file from how noisy it is",
     )
-    p.add_argument("--no-polish", action="store_true", help="skip level matching, compression and loudness normalisation")
+    p.add_argument("--no-leveling", action="store_true", help="skip level matching, compression and loudness normalisation")
     p.add_argument(
         "--audio-format", choices=list(AUDIO_CHOICES), default="same",
         help="format for audio files (video keeps its container); default: same as input",
@@ -58,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--loudness", choices=list(LOUDNESS_TARGETS), default=DEFAULT_LOUDNESS,
-        help="loudness target of the polish step: podcast -16 LUFS, youtube -14, broadcast -23, keep (default: podcast)",
+        help="loudness target of the leveling step: podcast -16 LUFS, youtube -14, broadcast -23, keep (default: podcast)",
     )
     p.add_argument(
         "--subtitles", choices=list(SUBTITLE_MODES), default="off",
@@ -123,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
         from . import cli
 
         options = JobOptions(
-            strength=args.strength, polish=not args.no_polish, audio_format=args.audio_format,
+            strength=args.strength, leveling=not args.no_leveling, audio_format=args.audio_format,
             loudness=args.loudness, subtitles=args.subtitles, language=args.language, noise=args.noise,
             echo_track=args.echo_track, restore_highs=not args.no_restore_highs, rebuild_voice=args.rebuild_voice,
             auto_rebuild=not args.no_auto_rebuild,

@@ -1,6 +1,6 @@
 """Clean one media file end to end. No Qt in here: the GUI worker and the CLI both call process().
 
-    probe -> [transcribe the original] -> decode -> DeepFilterNet3 (+ polish) -> write audio / mux into the video
+    probe -> [transcribe the original] -> decode -> DeepFilterNet3 (+ leveling) -> write audio / mux into the video
 
 The result is written next to the source (or into `out_dir`) as "<name>-cleaned.<ext>" (or under the name and in the
 format asked for: its ending says which, see available_endings()) and never replaces an existing file. A video can
@@ -59,7 +59,7 @@ _EMBED_ENDINGS = (".mp4", ".m4v", ".mov", ".mkv", ".webm")
 # Video size: the shorter side in pixels ("same" keeps the original).
 VIDEO_SIZES = ("same", "2160", "1440", "1080", "720", "480")
 
-# Loudness targets (LUFS) for the polish step; None keeps the level of the recording.
+# Loudness targets (LUFS) for the leveling step; None keeps the level of the recording.
 LOUDNESS_TARGETS: dict[str, float | None] = {"podcast": -16.0, "youtube": -14.0, "broadcast": -23.0, "keep": None}
 DEFAULT_LOUDNESS = "podcast"
 
@@ -109,7 +109,7 @@ Progress = Callable[[float], None]
 @dataclass(frozen=True)
 class JobOptions:
     strength: str = DEFAULT_STRENGTH
-    polish: bool = True
+    leveling: bool = True
     audio_format: str = "same"
     loudness: str = DEFAULT_LOUDNESS
     subtitles: str = "off"
@@ -604,6 +604,9 @@ def process(
     ff = ffmpeg(threads, cancel)
 
     info = probe(src, ff)
+    if not resources.noise_ready():  # setup's download failed, or a portable run: the app offers it (main_window, --download-models)
+        raise MediaError("Noise removal needs its models, which aren't downloaded yet. Download them (Audio Cleaner offers "
+                         "it when it starts, or run it with --download-models), then try again.")
     dest_dir = Path(out_dir) if out_dir is not None else src.absolute().parent
     out_stem, ext = split_name(output_name_for(src, Source.of(info), options, output_name, output_format))
     tmp_out = dest_dir / f".acw-{uuid.uuid4().hex}{ext}"
@@ -667,7 +670,7 @@ def process(
                 resources.libdf_path(),
                 resources.model_path(),
                 pipeline.CleanOptions(
-                    atten_lim_db=options.atten_lim_db, polish=options.polish, loudness_lufs=options.loudness_lufs,
+                    atten_lim_db=options.atten_lim_db, leveling=options.leveling, loudness_lufs=options.loudness_lufs,
                     noise=options.noise, restore_highs=options.restore_highs, restore_voice=rebuild,
                 ),
                 threads=threads,

@@ -1,19 +1,19 @@
-"""Locate the pieces the app needs: libDF, the noise model, FFmpeg (shipped) and the speech model
-for subtitles (downloaded once, see models.py).
+"""Locate the pieces the app needs: libDF, FFmpeg (shipped) and the models (downloaded once, see models.py).
 
 Frozen (PyInstaller) builds find the shipped pieces under sys._MEIPASS:
 
     native/{df.dll|libdf.dylib|libdf.so, ffmpeg[.exe], ffprobe[.exe]}
-    models/DeepFilterNet3_onnx.tar.gz
     licenses/
 
 From source the same layout is read from $ACW_DESKTOP_VENDOR (default
 desktop/vendor, filled by the packaging scripts). On Linux, missing pieces fall
 back to the server layout in ~/audio-cleaner/{bin,models}.
 
-The models for subtitles, restoring highs and rebuilding the voice are not in the app (a 2.5 GB download): the installer
-downloads them during setup, and Settings offers the download again when that failed. Runs from source (tests, CI) may use the small test model that
-prepare_vendor.py puts in vendor/test-models/ instead.
+No model is in the app. The noise removal models (DeepFilterNet3 and DPDFNet-8, 23 MB, REQUIRED: noise removal is what the
+app is for) and the ones for subtitles, restoring highs and rebuilding the voice (2.6 GB) are downloaded by the installer during setup;
+the app offers the download again when that failed (or after a portable run). Runs from source (tests, CI) also find the noise models in
+vendor/models (prepare_vendor.py --download-noise-models) or the server's models, and may use the small test speech model that
+prepare_vendor.py puts in vendor/test-models/.
 """
 from __future__ import annotations
 
@@ -28,10 +28,8 @@ _FFMPEG = f"ffmpeg{_EXE}"
 _FFPROBE = f"ffprobe{_EXE}"
 _WHISPER_FILES = ("model.bin", "config.json", "tokenizer.json")
 
-# The speech model is in every release, as separate files (each under GitHub's 2 GB per file), named "whisper-<file>";
-# CI takes them from dropbox-dash/faster-whisper-large-v3-turbo at commit 0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf on
-# Hugging Face and checks them against the hashes below.
-_TURBO = config.MODELS_URL + "whisper-"
+# The speech model comes straight from Hugging Face, pinned to one commit (its files are published there as they are).
+_TURBO = "https://huggingface.co/dropbox-dash/faster-whisper-large-v3-turbo/resolve/0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf/"
 SPEECH_MODEL = models.SpeechModel(
     id="whisper-large-v3-turbo",
     title="Speech model for subtitles",
@@ -52,29 +50,54 @@ SPEECH_MODEL = models.SpeechModel(
 )
 models.register(SPEECH_MODEL)
 
-# The two ONNX models and their licence texts come in ONE zip archive, in every release (config.MODELS_URL):
-# AP-BWE (MIT code and weights, github.com/yxlu-0102/AP-BWE), converted to ONNX by tools/export_apbwe_onnx.py, and
-# Sidon v0.1 (MIT; sarulab-speech/sidon-v0.1), converted to ONNX (docs/research/restore-sidon.md). The archive holds
-#   README.txt, LICENSES/*, ap-bwe/{8k,12k,16k,24k}to48k.onnx, sidon/{sidon_fe,sidon_dec}.onnx, and the heavy-noise model
-#   dpdfnet/dpdfnet8_48khz_hr_batch.onnx (bundled with the app anyway; the archive is the one complete set the server uses too)
-# Each model keeps its own folder and checks; the downloaders unpack the members each model lists (models.py).
-MODELS_ARCHIVE = models.ModelArchive(
-    name="AudioCleaner-models-v2.zip",
-    url=config.MODELS_URL + "AudioCleaner-models-v2.zip",  # in every release, next to the installers
-    size=922088329,
-    sha256="1c58ce59bdb9dfd41c4aabd0ae93e113604f3c75ac664d1b9130f555ab650d04",
-    shared=tuple(
-        models.ModelFile(f"LICENSES/{name}", "", size, sha, member=f"LICENSES/{name}")
-        for name, size, sha in (
-            ("AP-BWE-MIT.txt", 1817, "f05afcdb387530db09c6eb21c429a9d3417197da54cbc8e69f08affc62fb9beb"),
-            ("AP-BWE-weights-LICENSE.txt", 175, "506d3a47a2c84814c8d6a84f0450a18fb9d67c03bb30d8b7e9d357d9540be2d3"),
-            ("DPDFNet-Apache-2.0.txt", 11357, "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"),
-            ("Sidon-MIT.txt", 1722, "ba0678e7b808bfdf63e376a58586864a93e28345c7c6304fef743de9e1dbf15d"),
-            ("Training-data-attribution.txt", 1605, "19bb96ffa127f60569675f31e263df72bd683f8d7ed1f2382f9f78843dfab16d"),
-            ("w2v-BERT-2.0-MIT.txt", 1402, "5285eea4fed64499b8713ea99bf1aa947e6cf33c647ef8842b93adac9ce159bf"),
-        )
+# The two ONNX models are ours: AP-BWE (MIT code and weights, github.com/yxlu-0102/AP-BWE), converted to ONNX by
+# tools/export_apbwe_onnx.py, and Sidon v0.1 (MIT; sarulab-speech/sidon-v0.1), converted to ONNX
+# (docs/research/restore-sidon.md). Each is a plain per-file model like the speech model, downloaded from our Hugging
+# Face repository (config.hf_models_url), pinned by revision, size and SHA-256, so a user who wants one model downloads
+# only its files. The licence texts come with each model (`licences`: LICENSES/<name> in the model's folder; not part
+# of `files`, so they are not in the .complete marker, see models.py).
+def _hf(path: str, size: int, sha256: str, *, name: str = "") -> models.ModelFile:
+    """A file of the models repository; `name` is its path inside the model's folder (default: the repository path)."""
+    return models.ModelFile(name or path, config.hf_models_url(path), size, sha256)
+
+
+_LICENCE_TEXTS = {
+    "AP-BWE-MIT.txt": (1817, "f05afcdb387530db09c6eb21c429a9d3417197da54cbc8e69f08affc62fb9beb"),
+    "AP-BWE-weights-LICENSE.txt": (175, "506d3a47a2c84814c8d6a84f0450a18fb9d67c03bb30d8b7e9d357d9540be2d3"),
+    "Sidon-MIT.txt": (1722, "ba0678e7b808bfdf63e376a58586864a93e28345c7c6304fef743de9e1dbf15d"),
+    "Training-data-attribution.txt": (1605, "19bb96ffa127f60569675f31e263df72bd683f8d7ed1f2382f9f78843dfab16d"),
+    "DeepFilterNet-MIT.txt": (1083, "24e6bb09c928af8d8e56268082f87413247ce36b39dd5d33add2f9893968065e"),
+    "DeepFilterNet-Apache-2.0.txt": (10837, "1eaee808c5fb6b4e895ba30425285a5cdc5dd25bba2cd230f264c2200c331aec"),
+    "DPDFNet-Apache-2.0.txt": (11357, "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"),
+    "w2v-BERT-2.0-MIT.txt": (1402, "5285eea4fed64499b8713ea99bf1aa947e6cf33c647ef8842b93adac9ce159bf"),
+}
+
+
+def _licences(*names: str) -> tuple[models.ModelFile, ...]:
+    return tuple(_hf(f"LICENSES/{n}", *_LICENCE_TEXTS[n]) for n in names)
+
+
+# Noise removal: DeepFilterNet3 (the main remover, run by the bundled libDF) and DPDFNet-8 (heavy noise). One model with
+# both files, because they are used together (the app picks per recording, so either may be needed) and neither is
+# optional: one download, one marker, one line in the app, and setup cannot end up with only half of noise removal.
+# They are REQUIRED (`required`): the installers insist on them, and the app says so and offers the download when they
+# are missing instead of failing on a missing file. The files keep their bare names in the model's folder.
+NOISE_MODEL = models.SpeechModel(
+    id="noise-removal",
+    title="Noise removal models",
+    description="DeepFilterNet3 and DPDFNet-8: remove background noise (the second one for heavy noise).",
+    licence="DeepFilterNet3 by Hendrik Schroeter et al. (MIT or Apache-2.0), DPDFNet-8 by Ceva (Apache-2.0)",
+    files=(
+        _hf("deepfilternet3/DeepFilterNet3_onnx.tar.gz", 7983136,
+            "c94d91f70911001c946e0fabb4aa9adc37045f45a03b56008cb0c8244cb63616", name="DeepFilterNet3_onnx.tar.gz"),
+        _hf("dpdfnet/dpdfnet8_48khz_hr_batch.onnx", 14777093,
+            "b50417b070e63b22d32c3ab4e2ee056805cb8bc5ca8db053b1ce937bfc41bdaa", name="dpdfnet8_48khz_hr_batch.onnx"),
     ),
+    licences=_licences("DeepFilterNet-MIT.txt", "DeepFilterNet-Apache-2.0.txt", "DPDFNet-Apache-2.0.txt"),
+    required=True,
 )
+models.register(NOISE_MODEL)
+
 
 HIGHS_MODEL = models.SpeechModel(
     id="restore-highs",
@@ -82,7 +105,7 @@ HIGHS_MODEL = models.SpeechModel(
     description="AP-BWE: brings back the high frequencies of phone calls and other band-limited recordings.",
     licence="AP-BWE by Ye-Xin Lu et al. (MIT code and weights), trained on VCTK (CC BY 4.0)",
     files=tuple(
-        models.ModelFile(f"{name}to48k.onnx", "", 119093242, sha, member=f"ap-bwe/{name}to48k.onnx")
+        _hf(f"ap-bwe/{name}to48k.onnx", 119093242, sha, name=f"{name}to48k.onnx")
         for name, sha in (
             ("8k", "788d45ed37d399c0eeffca0462d7b9c2928871ae8523af67e96f9395720137a3"),
             ("12k", "eaa2d5822e1094d2ec93fd233be8b1f2a20ae76a41b2702d404aa0b7ac00d618"),
@@ -90,7 +113,7 @@ HIGHS_MODEL = models.SpeechModel(
             ("24k", "e662a7fe7243507fe766092a2b62869f55d75952fcce5ef8b1deb6d99076cf55"),
         )
     ),
-    archive=MODELS_ARCHIVE,
+    licences=_licences("AP-BWE-MIT.txt", "AP-BWE-weights-LICENSE.txt", "Training-data-attribution.txt"),
 )
 models.register(HIGHS_MODEL)
 
@@ -101,12 +124,12 @@ VOICE_MODEL = models.SpeechModel(
     description="Sidon: removes room echo and noise and restores dull sound by rebuilding the voice.",
     licence="Sidon by Wataru Nakata, Yuki Saito and the sarulab-speech group (MIT), with w2v-BERT 2.0 by Meta (MIT); trained on FLEURS-R and LibriTTS-R (CC BY 4.0)",
     files=(
-        models.ModelFile("sidon_fe.onnx", "", 397857704,
-                         "76222cc7f4dd95eb3d137d81783e73b69b00cab66b65a91790e0e72c96452a75", member="sidon/sidon_fe.onnx"),
-        models.ModelFile("sidon_dec.onnx", "", 104975475,
-                         "08c7547572f000d964f7dc3ef120fdf155c2d936721d9d320d20c6c4a1d652c4", member="sidon/sidon_dec.onnx"),
+        _hf("sidon/sidon_fe.onnx", 397857704, "76222cc7f4dd95eb3d137d81783e73b69b00cab66b65a91790e0e72c96452a75",
+            name="sidon_fe.onnx"),
+        _hf("sidon/sidon_dec.onnx", 104975475, "08c7547572f000d964f7dc3ef120fdf155c2d936721d9d320d20c6c4a1d652c4",
+            name="sidon_dec.onnx"),
     ),
-    archive=MODELS_ARCHIVE,
+    licences=_licences("Sidon-MIT.txt", "w2v-BERT-2.0-MIT.txt", "Training-data-attribution.txt"),
 )
 models.register(VOICE_MODEL)
 
@@ -144,17 +167,45 @@ def libdf_path() -> Path:
     return _locate("native", "bin", dfn.LIB_NAME) / dfn.LIB_NAME
 
 
+def _noise_file(name: str, *dev_dirs: Path) -> Path:
+    """One file of the noise removal models: the downloaded copy (the app's own or the installer's), else, when run from
+    source, the first of `dev_dirs` that has it (vendor/models for tests and CI, the server's models). When nothing is
+    there it is where the download will put it, so errors name it."""
+    found = models.location(NOISE_MODEL)
+    if found is not None:
+        return found / name
+    if not getattr(sys, "frozen", False):
+        for d in dev_dirs:
+            if (d / name).is_file():
+                return d / name
+    return models.model_dir(NOISE_MODEL) / name
+
+
+def _noise_dev_dirs(server_sub: str = "") -> list[Path]:
+    dirs = [_vendor_root() / "models"]
+    fallback = _dev_fallback()
+    if fallback is not None:
+        dirs.append(fallback / "models" / server_sub if server_sub else fallback / "models")
+    return dirs
+
+
 def model_path() -> Path:
+    """DeepFilterNet3's model tarball (see NOISE_MODEL)."""
     from acw_common import dfn
 
-    return _locate("models", "models", dfn.MODEL_FILE) / dfn.MODEL_FILE
+    return _noise_file(dfn.MODEL_FILE, *_noise_dev_dirs())
 
 
 def heavy_noise_model_path() -> Path:
-    """DPDFNet-8 (48 kHz), the noise remover for recordings with heavy background noise (ships with the app)."""
+    """DPDFNet-8 (48 kHz), the noise remover for recordings with heavy background noise (see NOISE_MODEL)."""
     from acw_common import dpdfnet
 
-    return _locate("models", "models/dpdfnet", dpdfnet.MODEL_FILE) / dpdfnet.MODEL_FILE
+    return _noise_file(dpdfnet.MODEL_FILE, *_noise_dev_dirs("dpdfnet"))
+
+
+def noise_ready() -> bool:
+    """Both noise removal models are there (downloaded, or found by the source-run fallbacks)."""
+    return model_path().is_file() and heavy_noise_model_path().is_file()
 
 
 def ffmpeg_dir() -> Path:
@@ -213,23 +264,21 @@ def licenses_dir() -> Path:
     return _vendor_root() / "licenses"
 
 
-def model_licenses_dir() -> Path | None:
-    """The licence texts that came with the downloaded models (<models>/LICENSES), or None before they were."""
-    return models.licences_dir()
+def model_licenses_dirs() -> list[Path]:
+    """The folders with the licence texts that came with the downloaded models (<model>/LICENSES of each installed model,
+    and the shared <models>/LICENSES of older installs); empty before there are any."""
+    return models.licence_dirs()
 
 
 def check() -> list[str]:
-    """File names of shipped components that are missing (empty when all present). The speech model is
-    not one of them: it is downloaded when subtitles are first wanted (speech_ready())."""
-    from acw_common import dfn, dpdfnet
+    """File names of shipped components that are missing (empty when all present). The models are not shipped: the
+    noise removal models are required but downloaded (noise_ready()), the speech model when subtitles are first
+    wanted (speech_ready())."""
+    from acw_common import dfn
 
     missing = []
     if not libdf_path().is_file():
         missing.append(dfn.LIB_NAME)
-    if not model_path().is_file():
-        missing.append(dfn.MODEL_FILE)
-    if not heavy_noise_model_path().is_file():
-        missing.append(dpdfnet.MODEL_FILE)
     ff = ffmpeg_dir()
     missing += [n for n in (_FFMPEG, _FFPROBE) if not (ff / n).is_file()]
     return missing

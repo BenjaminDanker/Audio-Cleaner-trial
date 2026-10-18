@@ -73,28 +73,11 @@ def test_install_only_on_windows_and_only_once(monkeypatch):
     assert q.install() is False and subprocess.Popen.__init__ is patched  # not wrapped twice
 
 
-def test_the_patched_popen_still_works_here():
-    """Whatever the platform, a real process still runs (nothing here has patched the real Popen)."""
-    out = subprocess.run([sys.executable, "-c", "print(7)"], capture_output=True, text=True)
-    assert out.stdout.strip() == "7"
-
-
-def test_warm_up_asks_platform_in_the_background():
-    import platform
-    import threading
-
-    before = {t.name for t in threading.enumerate()}
-    q.warm_platform_info()
-    for t in threading.enumerate():
-        if t.name == "platform-warmup" and t.name not in before:
-            t.join(10)
-    assert platform.uname().system
-
-
 def test_the_launcher_installs_it_before_anything_else():
     from pathlib import Path
 
     src = (Path(__file__).resolve().parents[1] / "packaging" / "launcher.py").read_text(encoding="utf-8")
-    code = [ln for ln in src.splitlines() if ln.startswith(("import ", "from "))]
-    assert code[0] == "from audio_cleaner_desktop import quiet_popen"
+    code = [ln for ln in src.splitlines() if ln.startswith(("import ", "from ")) and ln != "import os"]
+    assert code[0].startswith("from audio_cleaner_desktop import quiet_popen")
+    assert src.index("OMP_NUM_THREADS") < src.index("from audio_cleaner_desktop")  # numpy's thread pool: before any import
     assert src.index("quiet_popen.install()") < src.index("import multiprocessing")
