@@ -4,13 +4,16 @@ A free, offline app that removes background noise from the voice in video and au
 subtitles. It runs the shared cleaning pipeline (`../common/acw_common`) in a PySide6 window.
 Nothing is uploaded: FFmpeg and the noise library (libDF) ship inside the app, and the installer downloads every model
 once during setup, each from Hugging Face: the noise removal models (DeepFilterNet3 and DPDFNet-8, 23 MB, required) and
-the three larger ones (subtitles, restoring highs, rebuilding voices: Whisper 1.6 GB, AP-BWE 0.5 GB and Sidon 0.5 GB;
-2.6 GB in all). If a download fails, the app offers it again (the noise removal models as soon as it starts). The installed app also looks for a newer version when it starts and
+the two larger ones (subtitles, rebuilding voices: Whisper 1.6 GB and Sidon 0.5 GB;
+2.1 GB in all). If a download fails, the app offers it again (the noise removal models as soon as it starts). The installed app also looks for a newer version when it starts and
 installs it (a signed update; Settings > "Check for updates when Audio Cleaner starts", on by default; it sends
 nothing but a normal web request with the app version).
 
 - `audio_cleaner_desktop/engine.py` cleans one file (no Qt; used by the window and the command line)
-- `audio_cleaner_desktop/gui/` the window: queue, settings, preview, history, About
+- `audio_cleaner_desktop/copies.py`, `blend.py`, `redo.py` the saved copies of a job, the strength blend, change-and-save-again (no Qt)
+- `audio_cleaner_desktop/editor_job.py`, `editor_session.py`, `editor_model.py`, `live_mix.py` the per-part editor ("Fix a moment" and "Choose parts"): a job's block
+  cache, quotes, saving a timeline, suggestions, the live mix per part (no Qt)
+- `audio_cleaner_desktop/gui/` the window: queue, settings, preview, the Jobs tab (list, job view, the editor, live sound), About
 - `audio_cleaner_desktop/cli.py` the `--cli` and `--selftest` modes
 - `vendor/` native pieces for running from source (git-ignored, filled by the packaging scripts):
   `native/{libdf, ffmpeg, ffprobe}`, `licenses/`, and for tests and runs from source (never bundled) the noise models in
@@ -37,9 +40,24 @@ From the repository root, with `PYTHONPATH=desktop:common`:
 python -m audio_cleaner_desktop                       # the window; FILE... are queued
 python -m audio_cleaner_desktop --cli in.mp4 -o out/  # no window (see --help for the options)
 python -m audio_cleaner_desktop --cli talk.mp4 --output-name talk.mp3   # just the sound (also --format mp3, --video-size 720)
+python -m audio_cleaner_desktop --cli talk.mp4 --timeline parts.json  # only the parts a timeline file says (below)
 python -m audio_cleaner_desktop --selftest [--gui]    # checks the bundled native pieces (--gui: and the window)
 python -m audio_cleaner_desktop --download-models     # all the models (noise removal first), from a terminal
 ```
+
+A timeline file says what to do to which part of one recording (the format of `common/acw_common/timeline.py`, also the website's API):
+
+```json
+{"version": 1, "layers": {
+  "noise":    [{"start": 10, "end": 40, "strength_db": 24, "remover": "auto"}],
+  "rebuild":  [{"start": 41, "end": 44}],
+  "leveling": [{"start": 0, "end": 120, "loudness_lufs": -16}]}}
+```
+
+Times are seconds. Layers: `echo` (needs the file's second audio track), `noise` (`strength_db` 12 Gentle, 24 Balanced, 40 Strong, 100 Maximum, or the
+names; `remover` `auto`, `light`, `heavy`), `rebuild` (where it is on, it wins over the noise removal), `leveling` (`loudness_lufs` -70..0 or `null`).
+What a layer does not cover is left as it is. With `--timeline`, `--strength`, `--noise`, `--echo-track`, `--rebuild-voice`, `--no-leveling` and
+`--loudness` are not used. In the window the same editor is "Fix a moment" in a job and "Choose parts" under a waiting file.
 
 ## Tests
 

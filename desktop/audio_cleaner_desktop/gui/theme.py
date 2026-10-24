@@ -93,6 +93,9 @@ QLabel#Badge {{
 }}
 QLabel#Badge[kind="video"] {{ background: {t.brand}; color: white; }}
 
+QFrame#Sugg {{ background: {t.surface.name()}; border: 1px solid {t.border.name()}; border-radius: 10px; }}
+QFrame#Sugg[focus="true"] {{ border: 2px solid #7c4dff; background: {"#241a3f" if t.dark else "#f3effe"}; }}
+
 QFrame#Row {{ background: transparent; border-radius: 10px; }}
 QFrame#Row:hover {{ background: {t.hover.name()}; }}
 QWidget#RowHolder {{ background: transparent; }}
@@ -120,6 +123,7 @@ QPushButton#Primary[mode="cancel"] {{ background: {t.danger}; border-color: {t.d
 
 QPushButton#Flat, QToolButton {{ background: transparent; border: none; border-radius: 6px; padding: 5px 8px; }}
 QPushButton#Flat:hover, QToolButton:hover {{ background: {t.hover.name()}; }}
+QPushButton#Flat[on="true"] {{ background: {t.brand_soft}; color: {t.brand}; font-weight: 600; }}
 QPushButton#Flat:focus, QToolButton:focus {{ background: {t.hover.name()}; border: 1px solid {t.brand}; }}
 QToolButton {{ padding: 4px; }}
 QPushButton#Link {{ background: transparent; border: none; color: {t.brand}; padding: 2px 4px; text-decoration: underline; }}

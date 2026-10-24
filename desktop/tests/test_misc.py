@@ -94,34 +94,41 @@ def test_automatic_best_settings_are_on_by_default_and_keep_the_manual_choices(t
     assert prefs.auto_settings is True
     o = prefs.job_options()
     assert (o.strength, o.noise, o.atten_lim_db) == ("auto", "auto", None)
-    assert (o.restore_highs, o.rebuild_voice, o.auto_rebuild) == (True, False, True)
+    assert (o.rebuild_voice, o.auto_rebuild) == (False, True)
     # chosen by hand: kept, but not used while it is on
-    prefs.strength, prefs.noise, prefs.restore_highs, prefs.rebuild_voice = "gentle", "heavy", False, True
+    prefs.strength, prefs.noise, prefs.rebuild_voice = "gentle", "heavy", True
     o = prefs.job_options()
-    assert (o.strength, o.noise, o.restore_highs, o.rebuild_voice, o.auto_rebuild) == ("auto", "auto", True, False, True)
+    assert (o.strength, o.noise, o.rebuild_voice, o.auto_rebuild) == ("auto", "auto", False, True)
     prefs.auto_settings = False
     store.sync()
     again = Preferences(QSettings(str(tmp_path / "p.ini"), QSettings.Format.IniFormat))
     assert again.auto_settings is False
     o = again.job_options()
     assert (o.strength, o.noise, o.atten_lim_db) == ("gentle", "heavy", 12.0)
-    assert (o.restore_highs, o.rebuild_voice, o.auto_rebuild) == (False, True, False)
+    assert (o.rebuild_voice, o.auto_rebuild) == (True, False)
     again.auto_settings = True
     assert (again.job_options().strength, again.job_options().noise) == ("auto", "auto")
 
 
 def test_history_says_which_strength_was_picked():
     auto = {"strength": "auto", "noise": "auto", "leveling": False}
-    assert describe_settings({**auto, "picked_strength": "balanced"}, False) == "Balanced noise reduction (picked for this file)"
-    assert describe_settings({**auto, "picked_strength": "max"}, False) == "Maximum noise reduction (picked for this file)"
+    assert describe_settings({**auto, "picked_strength": "balanced"}, False) == "Balanced noise reduction (picked for this file; keeps your voice as recorded)"
+    assert describe_settings({**auto, "picked_strength": "max"}, False) == "Maximum noise reduction (picked for this file; keeps your voice as recorded)"
     assert describe_settings(auto, False) == "noise reduction picked for the file"  # e.g. a run that failed
     assert describe_settings({**auto, "picked_strength": "bogus"}, False) == "noise reduction picked for the file"
     # a strength chosen by hand is what is shown, whatever else is stored
     assert describe_settings({"strength": "gentle", "leveling": False, "picked_strength": "max"}, False) == "Gentle noise reduction"
     assert describe_settings({**auto, "rebuild_voice": True, "picked_strength": "max"}, False) == "voice rebuilt"
-    assert describe_settings({**auto, "auto_rebuild": True, "picked_rebuild": "echoey"}, False) == "voice rebuilt (it sounded echoey)"
+    assert describe_settings({**auto, "auto_rebuild": True, "picked_rebuild": "echoey"}, False) == "voice rebuilt (it sounded echoey; keeps only speech)"
     assert describe_settings({**auto, "auto_rebuild": True, "picked_rebuild": "muffled", "leveling": True, "loudness": "youtube"},
-                             False) == "voice rebuilt (it sounded muffled), leveled (YouTube)"
+                             False) == "voice rebuilt (it sounded muffled; keeps only speech), leveled (YouTube)"
+    assert describe_settings({**auto, "auto_rebuild": True, "picked_rebuild": "unclear"}, False) == "voice rebuilt (it sounded unclear; keeps only speech)"
+    # every reason is said in its own words ("it sounded phone" is not English), whatever was stored
+    assert describe_settings({**auto, "auto_rebuild": True, "picked_rebuild": "phone"}, False) == "voice rebuilt (it sounded like a phone call; keeps only speech)"
+    assert describe_settings({**auto, "auto_rebuild": True, "picked_rebuild": "distorted"}, False) == "voice rebuilt (it sounded distorted; keeps only speech)"
+    assert describe_settings({**auto, "auto_rebuild": True, "picked_rebuild": "phone", "leveling": True, "loudness": "youtube"},
+                             False) == "voice rebuilt (it sounded like a phone call; keeps only speech), leveled (YouTube)"
+    assert describe_settings({**auto, "auto_rebuild": True, "picked_rebuild": "something new"}, False) == "voice rebuilt (it sounded something new; keeps only speech)"
 
 
 def test_history_keeps_the_automatic_choices():
@@ -131,3 +138,20 @@ def test_history_keeps_the_automatic_choices():
     s = settings_dict(engine.JobOptions(strength="auto", auto_rebuild=True))
     assert (s["strength"], s["noise"], s["auto_rebuild"], s["rebuild_voice"]) == ("auto", "auto", True, False)
     assert settings_dict(engine.JobOptions())["auto_rebuild"] is False
+    assert "restore_highs" not in settings_dict(engine.JobOptions()) and "auto_highs" not in settings_dict(engine.JobOptions())
+
+
+def test_settings_and_history_saved_with_the_removed_highs_option_still_load(tmp_path):
+    """Restore highs is not a step any more: what an older version saved for it (the setting, the history's copy of the choices) is
+    read past without an error and without effect."""
+    store = QSettings(str(tmp_path / "old.ini"), QSettings.Format.IniFormat)
+    store.setValue("restore_highs", "true")
+    store.setValue("auto_settings", "false")
+    store.setValue("strength", "strong")
+    store.sync()
+    prefs = Preferences(QSettings(str(tmp_path / "old.ini"), QSettings.Format.IniFormat))
+    o = prefs.job_options()
+    assert (o.strength, o.noise) == ("strong", "auto") and not hasattr(o, "restore_highs") and not hasattr(prefs, "restore_highs")
+    old_entry = {"strength": "gentle", "noise": "auto", "leveling": True, "restore_highs": False, "auto_highs": True, "loudness": "podcast"}
+    assert describe_settings(old_entry, False) == "Gentle noise reduction, leveled (podcast)"
+    assert describe_settings({**old_entry, "restore_highs": True}, False) == "Gentle noise reduction, leveled (podcast)"

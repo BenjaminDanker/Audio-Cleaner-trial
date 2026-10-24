@@ -39,6 +39,9 @@ AUDIO_FORMATS = {
     "mp3": (".mp3", ["-c:a", "libmp3lame", "-b:a", "256k"]),
     "m4a": (".m4a", ["-c:a", "aac", "-b:a", "256k"]),
     "opus": (".opus", ["-c:a", "libopus", "-b:a", "128k"]),
+    # Not for people: the server keeps its intermediate results as 24-bit FLAC (exact to one 24-bit step, 1.2e-7 of full scale, a third to
+    # a half of the size of the 32-bit floats they are made of); the level is set by write_audio's `gain`.
+    "flac24": (".flac", ["-c:a", "flac", "-compression_level", "3", "-sample_fmt", "s32", "-bits_per_raw_sample", "24"]),
     "ogg": (".ogg", ["-c:a", "libopus", "-b:a", "128k"]),  # Opus in an Ogg file with the usual .ogg ending
 }
 
@@ -389,9 +392,9 @@ class FFmpeg:
             raise MediaError("The audio track is empty.")
         return np.memmap(raw, dtype=np.float32, mode="r", shape=(size, channels))
 
-    def write_audio(self, x: np.ndarray, sr: int, out: Path, fmt: str) -> Path:
+    def write_audio(self, x: np.ndarray, sr: int, out: Path, fmt: str, gain: float = 1.0) -> Path:
         """Encode float32 audio to `out` (suffix set by `fmt`), streaming it to
-        FFmpeg in blocks so a long (or memory-mapped) input is never copied whole."""
+        FFmpeg in blocks so a long (or memory-mapped) input is never copied whole. `gain` scales the samples on the way."""
         ext, codec_args = AUDIO_FORMATS[fmt]
         out = out.with_suffix(ext)
         channels = 1 if x.ndim == 1 else x.shape[1]
@@ -407,7 +410,8 @@ class FFmpeg:
                     for s in range(0, len(x), block):
                         if self._cancelled():
                             raise Cancelled()
-                        proc.stdin.write(np.ascontiguousarray(x[s:s + block], dtype=np.float32).tobytes())
+                        part = np.ascontiguousarray(x[s:s + block], dtype=np.float32)
+                        proc.stdin.write((part * np.float32(gain) if gain != 1.0 else part).tobytes())
                     proc.stdin.close()
                     proc.wait(timeout=3600)
                 except (BrokenPipeError, OSError):
@@ -561,7 +565,7 @@ class FFmpeg:
         timeout = max(7200.0, duration * 8)
         r = None
         used = 0
-        encoders = picture_encoders(ext)
+        encoders = list(video.encoders) if video is not None and video.encoders else picture_encoders(ext)
         for used, encoder in enumerate(encoders):
             args = self._black_args(audio, out, duration, subtitles, sub_lang, encoder, (width, height))
             r = self._run_encode(args, timeout, duration, progress)
@@ -635,7 +639,10 @@ class FFmpeg:
             args += ["-i", path_arg(audio)]
             maps += ["-map", "1:a:0", "-c:a", "copy", "-c:a:0", acodec[0], "-b:a:0", acodec[1]]
         else:
-            maps += ["-map", "0:a:0", "-c:a", "copy"]
+            # the file's own sound (none is fine): copied, or encoded as the container's own kind when it can't hold it as it is
+            maps += ["-map", "0:a:0?", "-c:a", "copy"]
+            if not plan.get("audio0_copy", True):
+                maps += ["-c:a:0", acodec[0], "-b:a:0", acodec[1]]
         for index in plan["audio"]:  # the file's other audio tracks, as they were
             maps += ["-map", f"0:{index}"]
         maps += ["-disposition:a", "0", "-disposition:a:0", "default"]
@@ -676,8 +683,11 @@ _TEXT_SUBS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
 def _plan_extras(info: ProbeResult | None, ext: str) -> dict:
     """Which of the source's other audio tracks and its subtitles go into a container with extension `ext`."""
     if info is None:
-        return {"audio": [], "subs": [], "total_audio": 0, "total_subs": 0}
+        return {"audio": [], "subs": [], "total_audio": 0, "total_subs": 0, "audio0_copy": True}
     audio: list[int] = []
+    # the first audio track, when it is kept as it is (no new sound): can this container hold it?
+    first = info.audio_codecs[0] if info.audio_codecs else None
+    audio0_copy = first is None or ext not in _COPY_AUDIO or _COPY_AUDIO[ext] is None or first in _COPY_AUDIO[ext]
     if ext in _COPY_AUDIO:
         allowed = _COPY_AUDIO[ext]
         audio = [idx for idx, codec in zip(info.audio_indices[1:], info.audio_codecs[1:]) if allowed is None or codec in allowed]
@@ -688,7 +698,7 @@ def _plan_extras(info: ProbeResult | None, ext: str) -> dict:
     else:
         subs = []
     return {"audio": audio, "subs": subs, "total_audio": max(0, len(info.audio_indices) - 1),
-            "total_subs": len(info.subtitle_streams)}
+            "total_subs": len(info.subtitle_streams), "audio0_copy": audio0_copy}
 
 
 def _container_codecs(ext: str) -> tuple[list[str], str]:
@@ -706,9 +716,13 @@ def _container_codecs(ext: str) -> tuple[list[str], str]:
 class VideoOut:
     """What the picture of a result should be like. `short_side`: the pixels of the shorter side; the picture is resized
     to it (plain lanczos resizing, same shape, never turned from portrait to landscape or back; bigger than the
-    original only stretches it). None keeps the size."""
+    original only stretches it). None keeps the size. `encoders`: the picture encoders to try, best first (None: the
+    app's own choice, picture_encoders()); the server names its own (the card's NVENC, x264). `fast`: VP9 at its
+    real-time speed (about x264's cost) instead of the slower, smaller setting."""
 
     short_side: int | None = None
+    encoders: tuple[str, ...] | None = None
+    fast: bool = False
 
 
 def _even(x: float) -> int:
@@ -743,7 +757,8 @@ _COPY_VIDEO = {
 # Containers that are the same kind of file as far as the picture goes.
 _SAME_KIND = (frozenset({".mp4", ".m4v"}),)
 # How many bits a second a picture of one pixel and one frame gets (the efficient encoders need fewer).
-_BITS_PER_PIXEL = {"h264_mf": 0.07, "h264_videotoolbox": 0.07, "libvpx-vp9": 0.05, "mpeg4": 0.14, "flv": 0.16}
+_BITS_PER_PIXEL = {"h264_mf": 0.07, "h264_videotoolbox": 0.07, "libx264": 0.07, "h264_nvenc": 0.08, "libvpx-vp9": 0.05, "mpeg4": 0.14,
+                   "flv": 0.16}
 
 
 def picture_encoders(ext: str) -> list[str]:
@@ -767,6 +782,40 @@ def picture_bitrate(encoder: str, width: int, height: int, fps: float, source_bp
     return int(min(max(target, floor), 80_000_000))
 
 
+def picture_copies(codec: str | None, src_ext: str | None, ext: str) -> bool | None:
+    """Can a picture coded as `codec` (FFmpeg's name), from a file ending in `src_ext`, go into a file ending in `ext` as it is?
+    None: the codec is not known."""
+    same_kind = src_ext is not None and (ext == src_ext or any(ext in kind and src_ext in kind for kind in _SAME_KIND))
+    if same_kind or ext not in _COPY_VIDEO:
+        return True
+    return None if not codec else codec in _COPY_VIDEO[ext]
+
+
+# Video conversion is priced in units of the work of making a 1080p picture at 30 frames a second again (billing/pricing.py).
+REFERENCE_PIXEL_RATE = 1920 * 1080 * 30
+
+
+def convert_factor(width: int, height: int, fps: float | None, out: tuple[int, int] | None = None) -> float:
+    """How many 1080p30 units making a `width` x `height` picture at `fps` again takes (`out`: the result's size, None: the same): the
+    result's pixels a second, or half the original's when that is more (decoding and shrinking a big picture is work too), never less
+    than 1. Measured with x264 (2026-10-22): 1080p60 2.2x, 1440p 1.6x, 4K 3.3x, 4K to 1080p 2.3x, 4K to 720p 1.8x, 1080p to 4K 4.3x."""
+    rate = fps if fps and 0 < fps <= 240 else 30.0
+    src = width * height * rate
+    res = out[0] * out[1] * rate if out else src
+    return round(max(1.0, res / REFERENCE_PIXEL_RATE, src / 2 / REFERENCE_PIXEL_RATE), 2)
+
+
+def picture_work(info: ProbeResult | None, ext: str, video: VideoOut) -> tuple[bool, float]:
+    """(is the picture made again, convert_factor) for a result ending in `ext` at `video`'s size. A sound has no picture to make
+    again: its video gets a plain black one (make_video, one frame a second), which costs next to nothing."""
+    plan = _picture_plan(info, ext, video)
+    if plan is None or info is None:
+        return False, 1.0
+    width, height = info.video_width, info.video_height
+    shown = (height, width) if info.video_rotation % 180 == 90 else (width, height)
+    return True, convert_factor(shown[0], shown[1], info.video_fps, plan["size"])
+
+
 def _picture_plan(info: ProbeResult | None, ext: str, video: VideoOut) -> dict | None:
     """What to do with the picture of `info` for a result ending in `ext`: None (copy it), or a dict with the encoders to
     try, the size, the frame rate and the bit rate base."""
@@ -780,8 +829,7 @@ def _picture_plan(info: ProbeResult | None, ext: str, video: VideoOut) -> dict |
         size = picture_size(width, height, info.video_sar, info.video_rotation, video.short_side)
         if size == shown and abs(info.video_sar - 1.0) < 0.01:
             size = None  # already that size
-    same_kind = ext == info.ext or any(ext in kind and info.ext in kind for kind in _SAME_KIND)
-    fits = same_kind or ext not in _COPY_VIDEO or info.video_codec in _COPY_VIDEO[ext]
+    fits = picture_copies(info.video_codec, info.ext, ext) is True
     if size is None and fits:
         return None
     if size is None and (shown[0] % 2 or shown[1] % 2):
@@ -789,9 +837,15 @@ def _picture_plan(info: ProbeResult | None, ext: str, video: VideoOut) -> dict |
     out = size or shown
     fps = info.video_fps or 30.0
     return {
-        "encoders": picture_encoders(ext), "size": size, "fps": fps, "out": out,
-        "source_bps": info.video_bitrate, "source_pixels": shown[0] * shown[1],
+        "encoders": list(video.encoders) if video.encoders else picture_encoders(ext), "size": size, "fps": fps, "out": out,
+        "source_bps": info.video_bitrate, "source_pixels": shown[0] * shown[1], "fast": video.fast,
     }
+
+
+def needs_picture_encode(info: ProbeResult | None, ext: str, video: VideoOut) -> bool:
+    """Is the picture of `info` made again for a result ending in `ext` at `video`'s size (a new size, or a file type that
+    can't hold it as it is)? False: it is copied."""
+    return _picture_plan(info, ext, video) is not None
 
 
 def _picture_args(encoder: str, picture: dict) -> list[str]:
@@ -808,7 +862,12 @@ def _picture_args(encoder: str, picture: dict) -> list[str]:
         args += ["-vf", f"scale={width}:{height}:flags=lanczos,setsar=1"]
     args += ["-c:v", encoder, "-b:v", str(bitrate), "-g", str(max(10, round(fps * 2))), "-pix_fmt", "yuv420p"]
     if encoder == "libvpx-vp9":
-        args += ["-deadline", "good", "-cpu-used", "4", "-row-mt", "1"]
+        args += ["-deadline", "realtime", "-cpu-used", "8"] if picture.get("fast") else ["-deadline", "good", "-cpu-used", "4"]
+        args += ["-row-mt", "1"]
+    elif encoder == "libx264":
+        args += ["-preset", "veryfast"]
+    elif encoder == "h264_nvenc":
+        args += ["-preset", "p4"]
     elif encoder == "h264_videotoolbox":
         args += ["-allow_sw", "1"]  # an Intel Mac without a hardware encoder
     return args

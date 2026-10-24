@@ -37,8 +37,27 @@ class _ProgressLine:
             print("\r" + " " * (len(self._label) + 7) + "\r", end="")
 
 
+def load_timeline(path: str) -> tuple[dict | None, str]:
+    """Read and check a timeline JSON file (acw_common.timeline, version 1). Returns (the timeline, "") or (None, what is wrong)."""
+    import json
+
+    from acw_common.timeline import Timeline, TimelineError
+
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as e:
+        return None, f"Can't read the timeline file {path}: {e.strerror or e}"
+    except ValueError:
+        return None, f"The timeline file {path} is not valid JSON."
+    try:
+        Timeline.from_json(raw, seconds=raw.get("seconds", engine.MAX_SECONDS) if isinstance(raw, dict) else None)
+    except TimelineError as e:
+        return None, f"The timeline file {path} is not valid: {e}"
+    return raw, ""
+
+
 def run(inputs: list[str], out_dir: str | None, options: engine.JobOptions, parallel: int = 1,
-        output_name: str | None = None, output_format: str | None = None) -> int:
+        output_name: str | None = None, output_format: str | None = None, timeline: dict | None = None) -> int:
     """Clean each input. Returns 0 when all succeed, 1 when any fails, 130 on Ctrl+C. `parallel` is the number
     of files cleaned at once (1-4, or 0 for Automatic), never more than the memory allows. `output_name` is the
     file name of the result (one input only); `output_format` the type ("mp3", "mp4", ...) of every result."""
@@ -61,6 +80,15 @@ def run(inputs: list[str], out_dir: str | None, options: engine.JobOptions, para
         print("Rebuilding the voice needs its model. Download it first: open Audio Cleaner, Settings, Extra cleanup "
               "(or run with --download-models).", file=sys.stderr)
         return 1
+    if timeline is not None:
+        if len(inputs) != 1:
+            print("--timeline works for one file at a time: its times are those of one recording.", file=sys.stderr)
+            return 1
+        layers = timeline.get("layers") if isinstance(timeline, dict) else None
+        if isinstance(layers, dict) and layers.get("rebuild") and resources.voice_model_dir() is None:
+            print("The timeline rebuilds the voice, which needs its model. Download it first: open Audio Cleaner, Settings, Extra cleanup "
+                  "(or run with --download-models).", file=sys.stderr)
+            return 1
     cancel = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: cancel.set())
     sysinfo.lower_priority()
@@ -75,7 +103,8 @@ def run(inputs: list[str], out_dir: str | None, options: engine.JobOptions, para
         line = _ProgressLine(label, tty=False if at_once > 1 else None)
         try:
             result = engine.process(name, options, out_dir=out_dir, progress=line, cancel=cancel, threads=threads,
-                                    output_name=output_name, output_format=output_format)
+                                    output_name=output_name, output_format=output_format,
+                                    **({"timeline": timeline} if timeline is not None else {}))
         except engine.Cancelled:
             line.finish()
             print(f"{label}  cancelled", file=sys.stderr)
@@ -108,14 +137,14 @@ def run(inputs: list[str], out_dir: str | None, options: engine.JobOptions, para
 
 
 def download_models() -> int:
-    """Download (or finish downloading) the models for noise removal (required), subtitles, restoring highs and
+    """Download (or finish downloading) the models for noise removal (required), subtitles and
     rebuilding the voice, with a progress line each."""
     from . import models
 
     cancel = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: cancel.set())
     worst = 0
-    for model in (resources.NOISE_MODEL, resources.SPEECH_MODEL, resources.HIGHS_MODEL, resources.VOICE_MODEL):
+    for model in (resources.NOISE_MODEL, resources.SPEECH_MODEL, resources.VOICE_MODEL):
         if models.is_installed(model):
             print(f"{model.title}: already there ({models.location(model)})")
             continue
@@ -155,10 +184,22 @@ def _check_speech_runtime() -> None:
         WhisperModel(str(path), device="cpu", compute_type="int8", cpu_threads=1, num_workers=1)
 
 
+def _clean(x: np.ndarray, remover: str, leveling: bool = True) -> np.ndarray:
+    """`x` cleaned the way the app cleans a file: the timeline of noise removal (and Leveling) on the whole of it, made by the editor's
+    renderer on one thread."""
+    from acw_common import editor
+    from acw_common.timeline import Timeline
+
+    from . import editor_job
+
+    tl = Timeline.whole_file(len(x) / pipeline.SAMPLE_RATE, noise={"strength_db": 100.0, "remover": remover}, leveling=leveling)
+    return editor.render(tl, editor.Inputs(x, "selftest"), None, editor_job.runner(1))
+
+
 def _check_models() -> list[str]:
     """One second of audio through each model the app runs: the heavy-noise remover (the required noise removal
     models must be installed); the optional ones are only checked where they are installed. Returns what was skipped."""
-    from acw_common import aec, bwe, restore
+    from acw_common import aec, restore
 
     sr = pipeline.SAMPLE_RATE
     t = np.arange(sr) / sr
@@ -166,24 +207,13 @@ def _check_models() -> list[str]:
     x = (0.2 * np.sin(2 * np.pi * 220 * t) + 0.03 * rng.standard_normal(t.size)).astype(np.float32)
     skipped = []
 
-    y = pipeline.clean_audio(
-        x, resources.libdf_path(), resources.model_path(), pipeline.CleanOptions(noise="heavy", leveling=False),
-        threads=1, heavy_model_path=resources.heavy_noise_model_path(),
-    )
+    y = _clean(x, "heavy", leveling=False)
     if y.shape != (x.size, 1) or not np.isfinite(y).all():
         raise RuntimeError("the heavy-noise remover returned unexpected audio")
 
     echo = aec.cancel_echo(x, np.roll(x, 480))
     if echo.shape != x.shape or not np.isfinite(echo).all():
         raise RuntimeError("the echo canceller returned unexpected audio")
-
-    highs = resources.highs_model_dir()
-    if highs is not None and bwe.available(highs):
-        y = bwe.extend(x, highs, threads=1, model="8k")
-        if y.shape != x.shape or not np.isfinite(y).all():
-            raise RuntimeError("the model that restores highs returned unexpected audio")
-    else:
-        skipped.append("highs model")
 
     voice = resources.voice_model_dir()
     if voice is not None and restore.available(voice):
@@ -194,6 +224,23 @@ def _check_models() -> list[str]:
     else:
         skipped.append("voice model")
     return skipped
+
+
+def _check_recommender() -> None:
+    """The trained model of "Automatic best settings" is in the build and decides (the measurements run on a second of
+    noisy tone, and a made-up voice with a made-up noise figure goes through the trees)."""
+    from acw_common import analysis, reco_model
+
+    sr = pipeline.SAMPLE_RATE
+    t = np.arange(sr) / sr
+    rng = np.random.default_rng(2)
+    x = (0.2 * np.sin(2 * np.pi * 220 * t) + 0.03 * rng.standard_normal(t.size)).astype(np.float32)
+    stats = analysis.measure_features(x, noise_db=20.0)
+    if not np.isfinite(stats["levelDb"]) or not 0 < stats["bandwidthHz"] <= sr / 2:
+        raise RuntimeError("the measurements of the automatic settings returned unexpected numbers")
+    rec = reco_model.recommend({**stats, "hasSpeech": True}, min_seconds=0.0)
+    if rec is None or rec.strength not in reco_model.STRENGTH_CLASSES:
+        raise RuntimeError("the automatic settings model returned no decision")
 
 
 def _check_gui() -> None:
@@ -290,8 +337,7 @@ def selftest(gui: bool = False) -> int:
         t = np.arange(3 * sr) / sr
         rng = np.random.default_rng(0)
         x = (0.2 * np.sin(2 * np.pi * 220 * t) + 0.03 * rng.standard_normal(t.size)).astype(np.float32)
-        y = pipeline.clean_audio(x, resources.libdf_path(), resources.model_path(), threads=1,
-                                 heavy_model_path=resources.heavy_noise_model_path())
+        y = _clean(x, "light")
         if y.shape != (x.size, 1) or not np.isfinite(y).all():
             raise RuntimeError("the noise reduction engine returned unexpected audio")
         ff = engine.ffmpeg()
@@ -303,6 +349,7 @@ def selftest(gui: bool = False) -> int:
         if abs(info.duration - 3.0) > 0.2 or info.audio_channels != 1 or decoded.size < 2.8 * sr:
             raise RuntimeError(f"FFmpeg round-trip mismatch (duration {info.duration:.2f} s)")
         _check_windows_quiet()
+        _check_recommender()
         _check_update_verification()
         _check_speech_runtime()
         skipped = _check_models()

@@ -1,34 +1,22 @@
 """The settings card: every option has a short tooltip and a "?" button with a longer explanation."""
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .. import engine, resources, sysinfo
+from ..labels import (  # noqa: F401 - the wording lives in labels.py (no Qt there); these names stay importable from here
+    FORMAT_LABELS, LOUDNESS_LABELS, LOUDNESS_SHORT, NOISE_LABELS, STRENGTH_LABELS, SUBTITLE_LABELS, VIDEO_SIZE_LABELS,
+)
+from ..labels import WHICH_TEXT, WHICH_TITLE
 from ..updater import UpdateController
 from . import tips
 from .preferences import Preferences
 from .speech_model import SpeechModelDownloader, SpeechModelPanel
 from .widgets import ElidedLabel, IconButton, Segmented, WrapCheck
 
-STRENGTH_LABELS = [("gentle", "Gentle"), ("balanced", "Balanced"), ("strong", "Strong"), ("max", "Maximum")]
-# The same wording as the website's Denoising form.
-LOUDNESS_LABELS = {
-    "podcast": "Podcast (\u221216 LUFS)", "youtube": "YouTube (\u221214 LUFS)", "broadcast": "Broadcast (\u221223 LUFS)",
-    "keep": "Keep original loudness",
-}
-LOUDNESS_SHORT = {"podcast": "podcast", "youtube": "YouTube", "broadcast": "broadcast", "keep": "original loudness"}
-NOISE_LABELS = {"auto": "Automatic", "light": "Light noise", "heavy": "Heavy noise"}
-SUBTITLE_LABELS = {
-    "off": "No subtitles", "srt": "SRT file", "vtt": "VTT file", "txt": "Text transcript", "embed": "Inside the video",
-}
-FORMAT_LABELS = {"same": "Same as the original", "wav": "WAV", "flac": "FLAC", "mp3": "MP3", "m4a": "M4A", "opus": "Opus"}
-VIDEO_SIZE_LABELS = {
-    "same": "Same as the original", "2160": "2160p (4K)", "1440": "1440p", "1080": "1080p (Full HD)", "720": "720p (HD)",
-    "480": "480p",
-}
 PARALLEL_LABELS = {0: "Automatic", 1: "1", 2: "2", 3: "3", 4: "4"}
 
 
@@ -78,14 +66,12 @@ class SettingsPanel(QFrame):
     changed = Signal()
 
     def __init__(self, prefs: Preferences, downloader: SpeechModelDownloader | None = None, parent: QWidget | None = None,
-                 highs_downloader: SpeechModelDownloader | None = None,
                  voice_downloader: SpeechModelDownloader | None = None, updater: UpdateController | None = None):
         super().__init__(parent)
         self.setObjectName("Card")
         self._prefs = prefs
         self.updater = updater or UpdateController(prefs, self)
         self.downloader = downloader or SpeechModelDownloader(self)
-        self.highs_downloader = highs_downloader or SpeechModelDownloader(self, resources.HIGHS_MODEL)
         self.voice_downloader = voice_downloader or SpeechModelDownloader(self, resources.VOICE_MODEL)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 20)
@@ -101,10 +87,12 @@ class SettingsPanel(QFrame):
             "Each file is listened to before it is cleaned and gets what fits it:\n"
             "\u2022 Noise reduction: Gentle for a quiet recording, up to Maximum for a noisy one\n"
             "\u2022 Background noise: the way of removing noise that suits it\n"
-            "\u2022 Missing highs: brought back when they are missing (phone calls, small files)\n"
-            "\u2022 Rebuild the voice: when it sounds echoey or muffled (needs its model, downloaded once)\n\n"
+            "\u2022 Rebuild the voice: when it sounds echoey, muffled, damaged or like a phone call, or distorts from being "
+            "recorded too loud (needs its model, downloaded once)\n\n"
             "The noise is measured by the noise remover itself, so wind, keyboards and chatter count as much as a "
-            "steady hiss. The list shows what each file got. Untick it to choose these yourself.",
+            "steady hiss. The list shows what each file got, and why: noise reduction keeps your voice exactly as recorded, "
+            "while rebuilding the voice fixes echo, a muffled or phone-quality voice and distortion but keeps only speech. "
+            "Untick it to choose these yourself.",
             self._auto,
         ))
 
@@ -117,7 +105,8 @@ class SettingsPanel(QFrame):
             "\u2022 Balanced: most of the noise goes, the room still sounds like a room.\n"
             "\u2022 Strong: nearly all of it goes.\n"
             "\u2022 Maximum: removes as much as it can. Best for noisy places.\n\n"
-            "Not sure? Maximum works well for most voice recordings. Try Gentle if the voice starts to sound thin.",
+            "Not sure? Maximum works well for most voice recordings. Try Gentle if the voice starts to sound thin.\n\n"
+            f"{WHICH_TITLE}\n{WHICH_TEXT}",
             self._strength,
         ))
 
@@ -131,8 +120,9 @@ class SettingsPanel(QFrame):
             self._noise,
         )
         self._auto_note = QLabel("Picked for each file while \u201cAutomatic best settings\u201d is on.")
-        self._auto_extra_note = QLabel("Restoring the highs and rebuilding the voice are picked for each file while "
-                                       "\u201cAutomatic best settings\u201d is on.")
+        self._auto_extra_note = QLabel("Rebuilding the voice is picked for each file while \u201cAutomatic best settings\u201d is on, "
+                                       "when it sounds echoey, muffled, damaged or distorted (it fixes that but keeps only speech); "
+                                       "otherwise noise reduction is used, which keeps your voice exactly as recorded.")
         self._auto_extra_note.setObjectName("Small")
         self._auto_extra_note.setWordWrap(True)
         self._auto_extra_note.hide()
@@ -193,38 +183,43 @@ class SettingsPanel(QFrame):
         self.downloader.changed.connect(self._refresh_enabled)
         layout.addWidget(sub_row)
 
-        self._highs = QCheckBox("Restore missing highs (phone-quality recordings)")
-        self._highs.setToolTip("For phone calls and other recordings that sound dull or muffled")
         self._echo = WrapCheck("Remove speaker echo using the second audio track (your desktop sound)")
         self._echo.setToolTip("For recordings with your desktop sound on a second audio track")
         self._rebuild = WrapCheck("Rebuild the voice")
-        self._rebuild.setToolTip("Also removes room echo and brings back dull sound. It takes several times longer. "
-                                 "Noise reduction and Background noise do not apply then.")
+        self._rebuild.setToolTip("For an echoey room, a muffled voice, phone-quality or damaged sound, or distortion from "
+                                 "recording too loud. It takes several times longer. Noise reduction and Background "
+                                 "noise do not apply then.")
         extra_row = _Row(
             "Extra cleanup",
-            "Restore missing highs: phone calls, voice messages, old or low-quality recordings have lost their high "
-            "frequencies, which makes them sound dull and muffled. Audio Cleaner brings them back, only for "
-            "recordings that really are missing them; normal recordings are never changed. It needs an extra model, "
-            "downloaded once.\n\n"
             "Remove speaker echo: if your speakers' sound got into your microphone (a game, a call, music), Audio "
             "Cleaner can remove it, but only when the recording also has that speaker sound on its own audio track. "
             "OBS can record that: in Settings > Output (Output Mode: Advanced) > Recording, tick audio tracks 1 "
             "and 2; then in Edit > Advanced Audio Properties put your mic on track 1 only and Desktop Audio on "
             "track 2 only. Files with one audio track are cleaned as usual.\n\n"
-            "Rebuild the voice: instead of filtering the noise out, Audio Cleaner rebuilds the voice, which also "
-            "removes room echo and brings back dull sound. It takes several times longer, and on very echoey "
+            "Rebuild the voice: instead of filtering the noise out, Audio Cleaner rebuilds the whole voice. Use it for a "
+            "recording made in an echoey room, a muffled voice, phone-quality or damaged sound (voice messages, very "
+            "small files) or distortion from recording too loud. It takes several times longer, and on very echoey "
             "recordings it can change a word, so listen before you publish. The Noise reduction and Background "
-            "noise settings do not apply to it.",
+            "noise settings do not apply to it.\n\n"
+            f"{WHICH_TITLE}\n{WHICH_TEXT}",
         )
         extra_row.layout_.addWidget(self._auto_extra_note)
-        extra_row.layout_.addWidget(self._highs)
-        self.highs_panel = SpeechModelPanel(
-            self.highs_downloader, need="Restoring the highs needs an extra model", what="the model that restores highs",
-        )
-        extra_row.layout_.addWidget(self.highs_panel)
-        self.highs_downloader.changed.connect(self._refresh_enabled)
         extra_row.layout_.addWidget(self._echo)
         extra_row.layout_.addWidget(self._rebuild)
+        self._which = QToolButton()
+        self._which.setText(WHICH_TITLE)
+        self._which.setCheckable(True)
+        self._which.setArrowType(Qt.ArrowType.RightArrow)
+        self._which.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._which.setToolTip("How noise reduction and Rebuild the voice differ")
+        self._which_text = QLabel(WHICH_TEXT)
+        self._which_text.setObjectName("Small")
+        self._which_text.setWordWrap(True)
+        self._which_text.hide()
+        self._which.toggled.connect(lambda on: (self._which_text.setVisible(on),
+                                                self._which.setArrowType(Qt.ArrowType.DownArrow if on else Qt.ArrowType.RightArrow)))
+        extra_row.layout_.addWidget(self._which, 0, Qt.AlignmentFlag.AlignLeft)
+        extra_row.layout_.addWidget(self._which_text)
         self.voice_panel = SpeechModelPanel(
             self.voice_downloader, need="Rebuilding the voice needs an extra model", what="the model that rebuilds the voice",
         )
@@ -330,7 +325,6 @@ class SettingsPanel(QFrame):
         self._loudness.currentIndexChanged.connect(lambda _: self._store("loudness", self._loudness.currentData()))
         self._noise.currentIndexChanged.connect(lambda _: self._store("noise", self._noise.currentData()))
         self._echo.toggled.connect(lambda v: self._store("echo_track", v))
-        self._highs.toggled.connect(lambda v: self._store("restore_highs", v))
         self._rebuild.toggled.connect(lambda v: self._store("rebuild_voice", v))
         self._subtitles.currentIndexChanged.connect(lambda _: self._store("subtitles", self._subtitles.currentData()))
         self._language.currentIndexChanged.connect(lambda _: self._store("language", self._language.currentData()))
@@ -356,7 +350,6 @@ class SettingsPanel(QFrame):
         _select(self._loudness, p.loudness)
         _select(self._noise, p.noise)
         self._echo.setChecked(p.echo_track)
-        self._highs.setChecked(p.restore_highs)
         self._rebuild.setChecked(p.rebuild_voice)
         _select(self._subtitles, p.subtitles)
         _select(self._language, p.language)
@@ -395,7 +388,7 @@ class SettingsPanel(QFrame):
         """Height with every optional line showing (subtitle language, output folder), so the window can be
         sized once to fit them all."""
         spacing = self.layout().spacing() // 2 + 6
-        optional = (self._language, self._folder_box, self.speech_panel, self.highs_panel, self.voice_panel,
+        optional = (self._language, self._folder_box, self.speech_panel, self.voice_panel,
                     self._rebuild_note, self._auto_note, self._auto_extra_note, self._update_status)
         extra = sum(w.sizeHint().height() + spacing for w in optional if w.isHidden())
         return self.sizeHint().height() + extra
@@ -406,7 +399,6 @@ class SettingsPanel(QFrame):
         rebuilt = self._rebuild.isChecked() and not auto  # always rebuilt (automatic rebuilds only some files)
         self._strength.setEnabled(not rebuilt and not auto)
         self._noise.setEnabled(not rebuilt and not auto)
-        self._highs.setEnabled(not auto)
         self._rebuild.setEnabled(not auto)
         self._rebuild_note.setVisible(rebuilt)
         self._auto_note.setVisible(auto)
@@ -415,8 +407,6 @@ class SettingsPanel(QFrame):
         self._language.setVisible(wants_subs)
         dl = self.downloader
         self.speech_panel.setVisible(dl.running or bool(dl.last_error) or (wants_subs and not dl.ready))
-        hd = self.highs_downloader
-        self.highs_panel.setVisible(hd.running or bool(hd.last_error) or ((auto or self._highs.isChecked()) and not hd.ready))
         vd = self.voice_downloader
         self.voice_panel.setVisible(vd.running or bool(vd.last_error) or ((auto or rebuilt) and not vd.ready))
         folder_mode = self._where.value() == "folder"

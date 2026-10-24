@@ -1,6 +1,7 @@
 """Clean one media file end to end. No Qt in here: the GUI worker and the CLI both call process().
 
-    probe -> [transcribe the original] -> decode -> DeepFilterNet3 (+ leveling) -> write audio / mux into the video
+    probe -> [transcribe the original] -> decode -> [measure, when something is left automatic] -> DeepFilterNet3
+        (+ leveling) -> write audio / mux into the video
 
 The result is written next to the source (or into `out_dir`) as "<name>-cleaned.<ext>" (or under the name and in the
 format asked for: its ending says which, see available_endings()) and never replaces an existing file. A video can
@@ -9,6 +10,7 @@ subtitles). Subtitles ("<name>-cleaned.srt" ...) go next to it, or into the vide
 """
 from __future__ import annotations
 
+import dataclasses
 import gc
 import logging
 import os
@@ -26,10 +28,11 @@ from pathlib import Path
 
 import numpy as np
 
-from acw_common import advice, captions, pipeline, transcribe
+from acw_common import analysis, captions, editor as editor_core, pipeline, reco_model, transcribe
 from acw_common.ffmpeg import AUDIO_FORMATS, FFmpeg, MediaError, ProbeResult, VideoOut
+from acw_common.timeline import Timeline
 
-from . import models, resources
+from . import copies, models, resources
 
 log = logging.getLogger(__name__)
 
@@ -37,9 +40,10 @@ Cancelled = pipeline.Cancelled
 
 # Maximum noise attenuation per strength preset; "max" is DeepFilterNet's no-limit setting
 # and matches Studio clean's default on the server (same pipeline).
-STRENGTHS: dict[str, float] = {"gentle": 12.0, "balanced": 24.0, "strong": 40.0, "max": 100.0}
+STRENGTHS: dict[str, float] = dict(reco_model.STRENGTH_DB)  # gentle 12, balanced 24, strong 40, max 100: shared with the server's API
 DEFAULT_STRENGTH = "max"
-# "auto": each file gets the strength that fits how noisy it is (pipeline.strength_for, measured by the noise remover).
+# "auto": each file gets the strength the trained model picks from how it sounds (reco_model.py, the same as the website's
+# "Automatic best settings"; measured once per file, analysis.py).
 AUTO_STRENGTH = "auto"
 STRENGTH_CHOICES = (AUTO_STRENGTH, *STRENGTHS)
 OUTPUT_AUDIO_FORMATS = ("wav", "flac", "mp3", "m4a", "opus")
@@ -80,7 +84,6 @@ LANGUAGES: dict[str, tuple[str, str]] = {
 MAX_SECONDS = 6 * 3600
 # Audio is processed through memory-mapped scratch files (~0.7 GB of disk per
 # hour and channel, twice), so long files need free disk space rather than RAM.
-LONG_FILE_SECONDS = 3 * 3600
 GB_PER_HOUR_PER_CHANNEL = 1.4
 
 _SAME_AS_INPUT = {
@@ -116,9 +119,9 @@ class JobOptions:
     language: str = "auto"
     noise: str = "auto"  # pipeline.NOISE_PROFILES: measured per file, or forced light / heavy
     echo_track: bool = False  # remove speaker echo using the file's second audio track (when it has one)
-    restore_highs: bool = True  # bring back the highs of phone-quality recordings (needs HIGHS_MODEL)
     rebuild_voice: bool = False  # Sidon instead of noise removal: also removes room echo; slow (VOICE_MODEL)
-    # Rebuild the voice of a file that sounds echoey or muffled (advice.rebuild_reason), when VOICE_MODEL is installed.
+    # Rebuild the voice of a file that sounds echoey, muffled, like a phone call or distorted, or that the trained model says
+    # needs it (reco_model.py), when VOICE_MODEL is installed.
     auto_rebuild: bool = False
     video_size: str = "same"  # of a video result: "same", or the pixels of the shorter side (VIDEO_SIZES)
 
@@ -142,6 +145,13 @@ class JobOptions:
     def atten_lim_db(self) -> float | None:
         """None: the one that fits each file (measured when it is cleaned)."""
         return None if self.strength == AUTO_STRENGTH else STRENGTHS[self.strength]
+
+    @property
+    def decides(self) -> bool:
+        """Something is left to the trained model (reco_model.py): the file is measured before it is cleaned."""
+        if self.rebuild_voice:  # the voice is rebuilt anyway: no strength, nothing to decide
+            return False
+        return self.strength == AUTO_STRENGTH or self.auto_rebuild
 
     @property
     def loudness_lufs(self) -> float | None:
@@ -168,7 +178,9 @@ class JobResult:
     language: str | None = None  # language the speech was transcribed in
     notice: str | None = None  # something the user should know about how the file was cleaned
     strength: str | None = None  # the strength picked for this file (STRENGTHS key) when it was set to automatic
-    rebuilt: str | None = None  # why the voice was rebuilt automatically ("echoey", "muffled"); None when it wasn't
+    rebuilt: str | None = None  # why the voice was rebuilt automatically ("echoey", "muffled", "unclear"); None when it wasn't
+    kept_dir: Path | None = None  # the folder with the saved copies (copies.py) when they were kept: the result can be changed later
+    made: dict | None = None  # the choices this result was made with, as the job remembers them (copies.JobCopies.made)
 
     @property
     def paths(self) -> list[Path]:
@@ -229,10 +241,6 @@ def default_ending(source: Source, options: JobOptions) -> str:
     if source.has_video:
         return source.ext if source.ext in _VIDEO_CONTAINERS else ".mkv"
     return AUDIO_FORMATS[_audio_format(source, options)][0]
-
-
-def output_extension(probe_result: ProbeResult, options: JobOptions) -> str:
-    return default_ending(Source.of(probe_result), options)
 
 
 def available_endings(source: Source) -> list[str]:
@@ -435,13 +443,12 @@ def _age(path: Path, now: float) -> float:
 
 
 def release_memory() -> None:
-    """Let go of the models kept in memory between files (the speech model, Sidon, AP-BWE, DPDFNet): the
+    """Let go of the models kept in memory between files (the speech model, Sidon, DPDFNet): the
     window calls this when the queue runs dry, so an idle app does not hold gigabytes."""
-    from acw_common import bwe, dpdfnet, restore
+    from acw_common import dpdfnet, restore
 
     transcribe.unload()
     restore.unload()
-    bwe.unload()
     dpdfnet.unload()
     gc.collect()
 
@@ -584,6 +591,8 @@ def process(
     threads: int | None = None,
     output_name: str | None = None,
     output_format: str | None = None,
+    keep_dir: Path | str | None = None,
+    timeline: "dict | object | None" = None,
 ) -> JobResult:
     """Clean `src` (and make subtitles when asked) and say what was written.
 
@@ -595,7 +604,16 @@ def process(
     (at the next checkpoint; encoding steps run to completion first). Raises
     MediaError for problems the user can act on. No partial output is left behind,
     and an existing file is never replaced, so the output cannot be the input.
-    `threads` limits the CPU threads this job uses."""
+    `threads` limits the CPU threads this job uses. `keep_dir`: a folder (copies.new_job_dir) for the job's saved copies: the block cache (what
+    each step made), the transcript, and a fingerprint of `src` (copies.py), which let the result be changed later without running a
+    model again (redo.py). It is removed again when the job is stopped, or fails before it made any block; a block that can't be written
+    never fails the job (the notice says so).
+
+    `timeline` (acw_common.timeline.Timeline or its JSON): what to do to which part of the recording (the per-part editor: echo removal,
+    noise removal, Voice rebuild and Leveling, each with its own parts and settings). What is outside every part of a layer is left as it
+    is. The strength, noise, Voice rebuild, Echo and Leveling choices of `options` are not used then (the timeline says it all); the subtitles,
+    the file type and the picture size are. The job keeps what it made, block by block (copies.py), so a part can be changed later without
+    running the rest again."""
     src = Path(src)
     options = options or JobOptions()
     cancel = cancel or threading.Event()
@@ -603,18 +621,23 @@ def process(
     threads = threads or worker_threads()
     ff = ffmpeg(threads, cancel)
 
-    info = probe(src, ff)
-    if not resources.noise_ready():  # setup's download failed, or a portable run: the app offers it (main_window, --download-models)
-        raise MediaError("Noise removal needs its models, which aren't downloaded yet. Download them (Audio Cleaner offers "
-                         "it when it starts, or run it with --download-models), then try again.")
-    dest_dir = Path(out_dir) if out_dir is not None else src.absolute().parent
-    out_stem, ext = split_name(output_name_for(src, Source.of(info), options, output_name, output_format))
-    tmp_out = dest_dir / f".acw-{uuid.uuid4().hex}{ext}"
     try:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        tmp_out.touch(exist_ok=False)
-    except OSError as e:
-        raise MediaError(f"Cannot write to the folder {dest_dir}: {e.strerror or e}") from e
+        info = probe(src, ff)
+        if not resources.noise_ready():  # setup's download failed, or a portable run: the app offers it (main_window, --download-models)
+            raise MediaError("Noise removal needs its models, which aren't downloaded yet. Download them (Audio Cleaner offers "
+                             "it when it starts, or run it with --download-models), then try again.")
+        dest_dir = Path(out_dir) if out_dir is not None else src.absolute().parent
+        out_stem, ext = split_name(output_name_for(src, Source.of(info), options, output_name, output_format))
+        tmp_out = dest_dir / f".acw-{uuid.uuid4().hex}{ext}"
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            tmp_out.touch(exist_ok=False)
+        except OSError as e:
+            raise MediaError(f"Cannot write to the folder {dest_dir}: {e.strerror or e}") from e
+    except BaseException:  # refused or stopped before the job began: the folder made for its copies is not needed
+        if keep_dir is not None:
+            copies.delete_job_dir(Path(keep_dir).parent, Path(keep_dir).name)
+        raise
 
     want_subs = options.subtitles != "off"
     embed = options.subtitles == "embed" and ext in _EMBED_ENDINGS
@@ -626,7 +649,7 @@ def process(
 
     sub_tmp = None
     x = y = None
-    claimed: list[Path] = []
+    keeper: copies.Keeper | None = None
     try:
         # Decoded and cleaned audio are memory-mapped scratch files, so RAM use stays flat. On Windows and macOS
         # they go to the app's own data folder (the result's folder is often synced to the cloud, and a USB
@@ -638,67 +661,81 @@ def process(
         ))
         try:
             _check_cancel(cancel)
+            if keep_dir is not None:
+                keeper = copies.Keeper(Path(keep_dir), src, media_facts(info), ff)
             notice = None
-            if options.echo_track:
-                if info.audio_tracks >= 2:
-                    mic = pipeline.decode_for_clean(ff, src, info, MAX_SECONDS, work_dir=work)
-                    x = pipeline.remove_echo(ff, src, info, mic, MAX_SECONDS, work_dir=work, cancel=cancel)
-                    mic = None
-                else:
-                    notice = "only one audio track, so no speaker echo was removed"
+            from . import editor_job  # (it imports this module)
+
+            # Every run is made one way: from a timeline (the per-part editor's), also one asked for with the whole-file choices of
+            # `options` (they become the timeline they stand for once the recording is measured, below), as on the server.
+            tl_run = _timeline_for(timeline, info)
+            cache = None  # the job's block cache (copies.py): what a run makes, the next edit starts from
+            sid = copies.source_id_of(copies.fingerprint(src))
+            if keeper is not None and keeper.job is not None:
+                cache = keeper.job.block_cache(ff)
+            echo_wanted = bool(tl_run.layers["echo"] if tl_run is not None else options.echo_track)
+            if echo_wanted and info.audio_tracks < 2:
+                notice = "only one audio track, so no speaker echo was removed"
+            echo_used = False
             segments, language = [], None
             if want_subs:
                 segments, language = _transcribe(
                     ff, src, info, work, options, threads, report.span(0.0, transcribe_end), cancel, echo_free=x
                 )
+                if keeper is not None:
+                    keeper.transcript(segments, language, echo_used)
                 _check_cancel(cancel)
             has_text = any(s.text.strip() for s in segments)
             if has_text and sub_kind != "off":
                 sub_tmp = work / f"subtitles{_SUBTITLE_SUFFIX[sub_kind]}"
                 sub_tmp.write_text(_subtitle_text(sub_kind, segments, language), encoding="utf-8")
 
-            if x is None:
-                x = pipeline.decode_for_clean(ff, src, info, MAX_SECONDS, work_dir=work)
+            x = pipeline.decode_for_clean(ff, src, info, MAX_SECONDS, work_dir=work)
+            if cache is not None:
+                keeper.blocks(len(x), echo_wanted and info.audio_tracks >= 2)
+                _keep_facts(keeper, x, info)
             report(decode_end)
             used: dict = {}
             voice_dir = resources.voice_model_dir()
-            reason = advice.rebuild_reason(x) if options.auto_rebuild and not options.rebuild_voice else None
-            _check_cancel(cancel)
-            rebuild = (options.rebuild_voice or reason is not None) and voice_dir is not None
-            y = pipeline.clean_audio(
-                x,
-                resources.libdf_path(),
-                resources.model_path(),
-                pipeline.CleanOptions(
-                    atten_lim_db=options.atten_lim_db, leveling=options.leveling, loudness_lufs=options.loudness_lufs,
-                    noise=options.noise, restore_highs=options.restore_highs, restore_voice=rebuild,
-                ),
-                threads=threads,
-                progress=report.span(decode_end, clean_end),
-                cancel=cancel,
-                out=pipeline.output_buffer(x, work),
-                heavy_model_path=resources.heavy_noise_model_path(),
-                bwe_model_dir=resources.highs_model_dir(),
-                restore_model_dir=voice_dir,
-                report=used,
-            )
-            picked = None
-            if options.strength == AUTO_STRENGTH and "atten_lim_db" in used:
-                picked = next((k for k, db in STRENGTHS.items() if db == used["atten_lim_db"]), None)
+            choices = reason = picked = None
+            rebuild = False
+            if tl_run is None:  # the whole-file choices, decided where they are left automatic, as the timeline they stand for
+                choices = _decide(x, options, cancel, voice_dir is not None)
+                reason = choices.rebuild_reason if choices is not None and options.auto_rebuild and not options.rebuild_voice else None
+                _check_cancel(cancel)
+                rebuild = (options.rebuild_voice and voice_dir is not None) or bool(choices is not None and choices.rebuild)
+                copts = _clean_options(options, choices, rebuild)
+                if copts.atten_lim_db is None:  # an automatic strength the trained model did not give: the noise figure's
+                    copts = dataclasses.replace(copts, atten_lim_db=_measured_strength(x, cancel))
+                if options.strength == AUTO_STRENGTH and not rebuild:
+                    picked = next((k for k, db in STRENGTHS.items() if db == copts.atten_lim_db), None)
+                tl_run = Timeline.from_clean_options(len(x) / pipeline.SAMPLE_RATE, copts, echo=echo_wanted and info.audio_tracks >= 2)
+            # the per-part editor's way: only the parts asked for, from the job's block cache (a first run fills it)
+            ref = None
+            if tl_run.layers["echo"] and info.audio_tracks >= 2:
+                ref = ff.decode_to_file(src, info, pipeline.SAMPLE_RATE, 1, MAX_SECONDS, work / "reference.f32", track=1)[:, 0]
+            inputs = editor_core.Inputs(x, sid, reference=ref, reference_id=editor_job.REFERENCE_ID if ref is not None else None)
+            y, tl_done, decided, tl_notice, _ = editor_job.render_timeline(
+                tl_run, inputs, keeper.quiet(cache) if cache is not None else None, work=work, threads=threads, progress=report.span(decode_end, clean_end), cancel=cancel,
+                out=pipeline.output_buffer(x, work))
+            notice = "; ".join(filter(None, [notice, tl_notice]))
+            echo_used = bool(tl_done.layers["echo"])
+            rebuild = bool(tl_done.layers["rebuild"])
             if reason and rebuild:
-                notice = "; ".join(filter(None, [notice, f"the voice was rebuilt because it sounded {reason}"]))
+                from . import labels  # (it imports this module)
+
+                notice = "; ".join(filter(None, [notice, labels.rebuild_reason_text(reason)]))
             elif reason:
-                notice = "; ".join(filter(None, [notice, f"it sounds {reason}: download the model that rebuilds the voice "
+                notice = "; ".join(filter(None, [notice, f"it sounds {reco_model.REBUILD_WORDS.get(reason, reason)}: download "
+                                                 "the model that rebuilds the voice "
                                                  "in Settings and clean it again to fix that"]))
             if options.rebuild_voice and not rebuild:
                 notice = "; ".join(filter(None, [notice, "the model that rebuilds the voice is not installed, so it was "
                                                  "cleaned the usual way. Download it in Settings to rebuild voices"]))
-            if used.get("highs"):
-                notice = "; ".join(filter(None, [notice, "missing highs restored"]))
-            elif options.restore_highs and resources.highs_model_dir() is None and _sounds_band_limited(x):
-                notice = "; ".join(filter(None, [notice, "sounds like a phone recording. Download the model that "
-                                                 "restores highs in Settings to improve it"]))
             _check_cancel(cancel)
+            made = {**made_with(options, used, rebuild, language, echo_used, picked), **editor_job.made_from_timeline(tl_done, echo=echo_used)}
+            if keeper is not None:
+                keeper.made(**made)
             kept = _write(ff, src, pipeline.as_output(y), info, options, tmp_out, sub_tmp if embed else None, language,
                           work=work, progress=report.span(clean_end, 0.99))
             if info.audio_tracks > 1:
@@ -710,18 +747,26 @@ def process(
             x = y = None
             _check_cancel(cancel)
             sidecar = sub_tmp is not None and not embed
-            final = claim_output(dest_dir, out_stem, ext, _SUBTITLE_SUFFIX[sub_kind] if sidecar else "", suffix="")
-            sub_final = final.with_suffix(_SUBTITLE_SUFFIX[sub_kind]) if sidecar else None
-            claimed = [final, *([sub_final] if sub_final else [])]
-            os.replace(tmp_out, final)
-            if sub_final is not None:
-                os.replace(sub_tmp, sub_final)
-            claimed = []
+            final, sub_final = place_result(dest_dir, out_stem, ext, tmp_out, sub_tmp if sidecar else None, sub_kind)
+            if keeper is not None:
+                if keeper.job is not None:  # the job's latest result stands for this timeline (and the removers it decided)
+                    editor_job.remember(keeper.job, tl_done, decided)
+                    keeper.job.add_save([final, *([sub_final] if sub_final else [])], made)
+                if keeper.finish():
+                    notice = "; ".join(filter(None, [notice, keeper.lost and f"saved copies for changing this later could not "
+                                                             f"all be kept ({keeper.lost})"]))
+                else:
+                    notice = "; ".join(filter(None, [notice, f"this one can't be changed and saved again later: its saved copies "
+                                                             f"could not be kept ({keeper.lost or 'nothing to keep'})"]))
         except BaseException as e:
             # A cancelled or failed job's traceback still holds the memory-mapped scratch arrays
-            # (in clean_audio's frames); Windows can't delete a file that is still mapped.
+            # (in the renderer's frames); Windows can't delete a file that is still mapped.
             x = y = None
             traceback.clear_frames(e.__traceback__)
+            if keeper is not None:  # stopped: nothing is kept. Failed: what was made before it failed stays (changing it later may still work)
+                keeper.discard() if isinstance(e, Cancelled) else keeper.finish()
+            elif keep_dir is not None:  # stopped or failed before the first copy could be made
+                copies.delete_job_dir(Path(keep_dir).parent, Path(keep_dir).name)
             raise
         finally:
             x = y = None
@@ -736,23 +781,120 @@ def process(
                 threading.Thread(target=_remove_work_dir, args=(work,), name="scratch-cleanup", daemon=True).start()
     finally:
         tmp_out.unlink(missing_ok=True)
+    report(1.0)
+    kept_here = keeper is not None and keeper.job is not None and bool(keeper.job)
+    return JobResult(
+        final, info.duration, info.has_video, sub_final, embedded=embed and sub_tmp is not None, language=language,
+        notice=notice or None, strength=picked, rebuilt=reason if rebuild else None,
+        kept_dir=Path(keep_dir) if kept_here else None, made=made,
+    )
+
+
+def _timeline_for(timeline, info: ProbeResult):
+    """The timeline a run was given, read for this recording (None: the whole-file defaults). MediaError when it is not valid."""
+    if timeline is None:
+        return None
+    from acw_common.timeline import Timeline, TimelineError
+
+    try:
+        if isinstance(timeline, Timeline):
+            return Timeline.from_json(timeline.to_json(), seconds=info.duration)
+        return Timeline.from_json(timeline, seconds=info.duration)
+    except TimelineError as e:
+        raise MediaError(f"The timeline is not valid: {e}") from e
+
+
+def _keep_facts(keeper: "copies.Keeper", x: np.ndarray, info: ProbeResult) -> None:
+    """What the editor needs to plan without decoding the original again (editor_job.py); never fails the job."""
+    if keeper.job is None:
+        return
+    try:
+        from . import editor_job
+
+        inputs = editor_core.Inputs(x, copies.source_id_of(keeper.job.fingerprint))
+        editor_job.store_facts(keeper.job, inputs, x, reference=info.audio_tracks >= 2)
+    except Exception:  # noqa: BLE001 - the editor can work it out when it is opened
+        log.warning("could not keep the facts of the recording", exc_info=True)
+
+
+def media_facts(info: ProbeResult) -> dict:
+    """What a job remembers about its original (copies.JobCopies.media)."""
+    return {
+        "duration": info.duration, "has_video": info.has_video, "ext": info.ext, "video_codec": info.video_codec,
+        "channels": info.audio_channels, "audio_tracks": info.audio_tracks,
+    }
+
+
+def made_with(options: JobOptions, used: dict, rebuilt: bool, language: str | None, echo: bool, picked: str | None) -> dict:
+    """The choices a result was made with, as they were in the end (the automatic ones settled): what "Change and save again" starts from."""
+    atten = None if rebuilt else used.get("atten_lim_db")
+    key = picked or (options.strength if options.strength != AUTO_STRENGTH and not rebuilt else None)
+    return {
+        "atten_lim_db": atten, "strength": key, "noise": used.get("noise"), "noise_option": options.noise, "rebuilt": bool(rebuilt), "leveling": options.leveling,
+        "loudness": options.loudness, "audio_format": options.audio_format, "subtitles": options.subtitles,
+        "language": language or options.language, "video_size": options.video_size, "echo": bool(echo),
+    }
+
+
+def place_result(dest_dir: Path, out_stem: str, ext: str, tmp_out: Path, sub_tmp: Path | None, sub_kind: str) -> tuple[Path, Path | None]:
+    """Take the name for a finished result (and its subtitle file `sub_tmp`) and move the temporary file(s) there. A taken name gets
+    " (2)" and so on; an existing file is never replaced. Returns (the result, the subtitle file or None)."""
+    sidecar = sub_tmp is not None
+    final = claim_output(dest_dir, out_stem, ext, _SUBTITLE_SUFFIX[sub_kind] if sidecar else "", suffix="")
+    sub_final = final.with_suffix(_SUBTITLE_SUFFIX[sub_kind]) if sidecar else None
+    claimed = [final, *([sub_final] if sub_final else [])]
+    try:
+        os.replace(tmp_out, final)
+        if sub_final is not None:
+            os.replace(sub_tmp, sub_final)
+    except BaseException:
         for placeholder in claimed:  # a name taken but never filled (the job failed in between)
             try:
                 if placeholder.stat().st_size == 0:
                     placeholder.unlink()
             except OSError:
                 pass
-    report(1.0)
-    return JobResult(
-        final, info.duration, info.has_video, sub_final, embedded=embed and sub_tmp is not None, language=language,
-        notice=notice, strength=picked, rebuilt=reason if rebuild else None,
+        raise
+    return final, sub_final
+
+
+def _decide(
+    x: np.ndarray, options: JobOptions, cancel: threading.Event, voice_model: bool,
+) -> reco_model.Choices | None:
+    """What "Automatic best settings" settle for this recording, when anything is left to the trained model (JobOptions.decides):
+    the recording is measured once (analysis.measure: about a minute of it, spread over the file, and the noise remover over the
+    same parts) and reco_model.choose turns the measurements into settings, the same function the server's API jobs use. The
+    voice is rebuilt only if the user left that automatic and its model is installed (`voice_model`)."""
+    if not options.decides:
+        return None
+    stats = analysis.measure(x, resources.libdf_path(), resources.model_path(), cancel)
+    # An unusually short recording is decided like any other (the website only recommends nothing for under two seconds).
+    rec = reco_model.recommend(stats, min_seconds=0.0)
+    if rec is None:
+        return None
+    return reco_model.choose(rec, rebuild_available=voice_model and options.auto_rebuild and not options.rebuild_voice)
+
+
+def _measured_strength(x: np.ndarray, cancel: threading.Event) -> float:
+    """The automatic strength for a recording the trained model gave none for: the one its noise figure calls for (pipeline.automatic_choices,
+    the rule the old whole-file engine used too)."""
+    figure = pipeline.noise_figure_db(x, resources.libdf_path(), resources.model_path(), cancel)
+    return float(pipeline.automatic_choices(figure, analysis.measure_features(x, figure))[1])
+
+
+def _clean_options(options: JobOptions, choices: reco_model.Choices | None, rebuild: bool) -> pipeline.CleanOptions:
+    """The settings clean_audio gets: the user's choices, and the automatic ones (reco_model.Choices) wherever they are left
+    automatic. Nothing the user chose is overridden. The strength and the noise remover are given outright when the file was
+    measured, so the measurement is not repeated."""
+    atten, noise = options.atten_lim_db, options.noise
+    if choices is not None:
+        if options.strength == AUTO_STRENGTH:
+            atten = choices.atten_lim_db
+        if options.noise == "auto":
+            noise = choices.noise  # the rule: a noise figure below pipeline.HEAVY_BELOW_DB
+    return pipeline.CleanOptions(
+        atten_lim_db=atten, leveling=options.leveling, loudness_lufs=options.loudness_lufs, noise=noise, restore_voice=rebuild,
     )
-
-
-def _sounds_band_limited(x: np.ndarray) -> bool:
-    from acw_common import bwe
-
-    return bwe.pick_model(bwe.effective_bandwidth(x)) is not None  # read block by block, however long x is
 
 
 def _remove_work_dir(work: Path) -> None:

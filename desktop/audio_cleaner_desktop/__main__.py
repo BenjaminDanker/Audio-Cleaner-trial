@@ -35,12 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gui", action="store_true", help="with --selftest: also build the window, the preview and the About box")
     p.add_argument(
         "--download-models", "--download-speech-model", action="store_true", dest="download_models",
-        help="download the models for noise removal, subtitles, restoring highs and rebuilding the voice (about 2.6 GB, once) and exit",
+        help="download the models for noise removal, subtitles and rebuilding the voice (about 2.1 GB, once) and exit",
     )
     p.add_argument("-o", "--output-dir", metavar="OUTDIR", help="write results here (default: next to each original)")
     p.add_argument(
         "--strength", choices=list(STRENGTH_CHOICES), default=AUTO_STRENGTH,
-        help="noise reduction strength; auto (default) picks the one that fits each file from how noisy it is",
+        help="noise reduction strength; auto (default) picks the one that fits each file from how it sounds",
     )
     p.add_argument("--no-leveling", action="store_true", help="skip level matching, compression and loudness normalisation")
     p.add_argument(
@@ -82,14 +82,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--echo-track", action="store_true",
         help="remove speaker echo using the file's second audio track (files with one track are cleaned as usual)",
     )
-    p.add_argument("--no-restore-highs", action="store_true", help="do not restore the missing highs of phone-quality recordings")
     p.add_argument(
         "--rebuild-voice", action="store_true",
-        help="rebuild the voice instead of filtering noise: also removes room echo; slow, needs its model",
+        help="rebuild the voice instead of filtering noise: fixes room echo, a muffled voice, phone-quality or damaged sound "
+        "and distortion from recording too loud; slow, needs its model",
     )
     p.add_argument(
         "--no-auto-rebuild", action="store_true",
-        help="do not rebuild the voice of files that sound echoey or muffled (by default they are, when its model is installed)",
+        help="do not rebuild the voice of files that need it (echo, a muffled or unclear voice, phone-quality sound, distortion; "
+        "by default they are, when its model is installed)",
+    )
+    p.add_argument(
+        "--timeline", metavar="FILE",
+        help="process only the parts a timeline file says (one file only): a JSON file with the layers echo, noise, rebuild and leveling, "
+        "each with parts that have their own settings (see docs/desktop.md). Parts outside every part of a layer are left as they are. "
+        "Then --strength, --noise, --echo-track, --rebuild-voice, --no-leveling and --loudness are not used; the file type, subtitles "
+        "and video size are",
     )
     p.add_argument(
         "--parallel", type=int, choices=range(0, 5), default=1, metavar="N",
@@ -131,13 +139,18 @@ def main(argv: list[str] | None = None) -> int:
         options = JobOptions(
             strength=args.strength, leveling=not args.no_leveling, audio_format=args.audio_format,
             loudness=args.loudness, subtitles=args.subtitles, language=args.language, noise=args.noise,
-            echo_track=args.echo_track, restore_highs=not args.no_restore_highs, rebuild_voice=args.rebuild_voice,
-            auto_rebuild=not args.no_auto_rebuild,
+            echo_track=args.echo_track,
+            rebuild_voice=args.rebuild_voice, auto_rebuild=not args.no_auto_rebuild,
             video_size=args.video_size,
         )
         if args.output_name is not None and len(args.files) != 1:
             parser.error("--output-name works for one file at a time; use --format to choose the type of several")
-        return cli.run(args.files, args.output_dir, options, args.parallel, args.output_name, args.output_format)
+        timeline = None
+        if args.timeline is not None:
+            timeline, problem = cli.load_timeline(args.timeline)
+            if timeline is None:
+                parser.error(problem)
+        return cli.run(args.files, args.output_dir, options, args.parallel, args.output_name, args.output_format, timeline)
 
     from .gui.app import run
 

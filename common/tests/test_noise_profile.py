@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from acw_common import dpdfnet, pipeline
+from acw_common import pipeline
 
 from test_common import LIB, MODEL, needs_dfn
 
@@ -46,11 +46,9 @@ def test_noise_that_comes_and_goes_counts_too():
 
 
 @needs_dfn
-def test_auto_picks_heavy_only_for_noisy_recordings_and_choices_can_be_forced():
-    assert pipeline.choose_noise_profile(_speechlike(6, 30), LIB, MODEL) == "light"
-    assert pipeline.choose_noise_profile(_speechlike(6, -2), LIB, MODEL) == "heavy"
-    assert pipeline.choose_noise_profile(_speechlike(1, -2), "lib", "model", "light") == "light"  # nothing measured
-    assert pipeline.choose_noise_profile(_speechlike(1, 30), "lib", "model", "heavy") == "heavy"
+def test_auto_picks_heavy_only_for_noisy_recordings():
+    assert pipeline.automatic_choices(_figure(_speechlike(6, 30)))[0] == "light"
+    assert pipeline.automatic_choices(_figure(_speechlike(6, -2)))[0] == "heavy"
 
 
 def test_a_long_stereo_recording_is_measured_from_its_mono_mix_in_six_stretches(tmp_path, monkeypatch):
@@ -67,9 +65,7 @@ def test_a_long_stereo_recording_is_measured_from_its_mono_mix_in_six_stretches(
         return seg * 0.5
 
     monkeypatch.setattr(pipeline.dfn, "denoise_array", remover)
-    keep: dict = {}
-    pipeline.noise_figure_db(mm, "lib", "model", keep=keep)
-    assert keep == {}  # only a recording measured in one piece can stand in for its cleaning
+    pipeline.noise_figure_db(mm, "lib", "model")
     assert [len(g) for g in got] == [10 * SR] * 6
     for g, (a, b) in zip(got, windows):
         assert np.allclose(g, x[a:b], atol=1e-7)
@@ -93,151 +89,6 @@ def test_strength_steps_by_noise_figure():
     assert [pipeline.strength_for(db) for db in (24.0, 30.0, 99.0)] == [12.0, 12.0, 12.0]  # 99: a silent recording
     belows = [b for b, _ in pipeline.STRENGTH_STEPS]
     assert belows == sorted(belows)  # steps in order, or strength_for would skip one
-
-
-def _fake_removers(monkeypatch, figure):
-    measured, used = [], []
-    monkeypatch.setattr(pipeline, "noise_figure_db", lambda x, lib, model, cancel=None, keep=None: measured.append(1) or figure)
-    for mod, name in ((pipeline.dfn, "dfn"), (pipeline.dpdfnet, "dpdfnet")):
-        monkeypatch.setattr(mod, "denoise_array", lambda x, *a, out=None, _n=name, **k:
-                            used.append((_n, k["atten_lim_db"])) or out.__setitem__(slice(None), x))
-    return measured, used
-
-
-@pytest.mark.parametrize(("figure", "remover", "strength"), [(5.0, "dpdfnet", 100.0), (19.5, "dfn", 40.0), (30.0, "dfn", 12.0)])
-def test_automatic_strength_is_measured_once_with_the_remover_choice(monkeypatch, tmp_path, figure, remover, strength):
-    measured, used = _fake_removers(monkeypatch, figure)
-    report: dict = {}
-    pipeline.clean_audio(_speechlike(2, 10), "lib", "model", pipeline.CleanOptions(noise="auto", atten_lim_db=None, leveling=False),
-                         heavy_model_path=tmp_path / dpdfnet.MODEL_FILE, report=report)
-    assert len(measured) == 1 and used == [(remover, strength)]
-    assert report == {"noise": "heavy" if remover == "dpdfnet" else "light", "highs": None,
-                      "atten_lim_db": strength, "noise_db": figure}
-
-
-def test_automatic_strength_with_a_forced_remover_still_measures_once(monkeypatch, tmp_path):
-    measured, used = _fake_removers(monkeypatch, 21.234)
-    report: dict = {}
-    pipeline.clean_audio(_speechlike(2, 10), "lib", "model", pipeline.CleanOptions(noise="heavy", atten_lim_db=None, leveling=False),
-                         heavy_model_path=tmp_path / dpdfnet.MODEL_FILE, report=report)
-    assert len(measured) == 1 and used == [("dpdfnet", 24.0)]
-    assert report["noise"] == "heavy" and report["atten_lim_db"] == 24.0 and report["noise_db"] == 21.2  # rounded
-
-
-def test_a_chosen_remover_and_strength_measure_nothing(monkeypatch):
-    measured, used = _fake_removers(monkeypatch, 5.0)
-    report: dict = {}
-    pipeline.clean_audio(_speechlike(2, 10), "lib", "model", pipeline.CleanOptions(noise="light", atten_lim_db=40.0, leveling=False),
-                         report=report)
-    assert measured == [] and used == [("dfn", 40.0)]
-    assert report == {"noise": "light", "highs": None, "atten_lim_db": 40.0}  # no noise_db: nothing was measured
-
-
-def test_every_channel_gets_the_one_strength(monkeypatch):
-    """A stereo recording is measured once (its mono mix) and both sides are cleaned with the same strength."""
-    measured, used = _fake_removers(monkeypatch, 18.0)
-    x = np.stack([_speechlike(2, 10, seed=1), _speechlike(2, 10, seed=2)], 1)
-    pipeline.clean_audio(x, "lib", "model", pipeline.CleanOptions(noise="light", atten_lim_db=None, leveling=False))
-    assert len(measured) == 1 and used == [("dfn", 40.0), ("dfn", 40.0)]
-
-
-@needs_dfn
-def test_a_short_recordings_measurement_is_reused_as_its_cleaning_bit_for_bit(monkeypatch):
-    """Up to 75 s the noise figure is measured over the whole recording at full strength: with the light remover at
-    full strength that is the cleaning, so DeepFilterNet3 does not run twice (mono, and dual-mono stereo)."""
-    mono = _speechlike(3, 5)
-    keep: dict = {}
-    pipeline.choose_noise_profile(mono, LIB, MODEL, "auto", keep=keep)
-    assert np.array_equal(keep["measured"].mono, mono) and len(keep["measured"].light) == len(mono)
-    opts = pipeline.CleanOptions(noise="light", atten_lim_db=100.0, leveling=False)
-    stereo = np.stack([mono, mono], 1)
-    fresh = {k: pipeline.clean_audio(x, LIB, MODEL, opts, threads=1) for k, x in (("mono", mono), ("stereo", stereo))}
-    runs = []
-    real = pipeline.dfn.denoise_array
-    monkeypatch.setattr(pipeline.dfn, "denoise_array", lambda *a, **k: runs.append(1) or real(*a, **k))
-    for k, x in (("mono", mono), ("stereo", stereo)):
-        assert np.array_equal(pipeline.clean_audio(x, LIB, MODEL, opts, threads=1, measured=keep["measured"]), fresh[k])
-    assert runs == []
-
-
-@pytest.mark.parametrize(("what", "opts", "x"), [
-    ("weaker", dict(noise="light", atten_lim_db=40.0), _speechlike(2, 5)),
-    ("heavy", dict(noise="heavy", atten_lim_db=100.0), _speechlike(2, 5)),
-    ("real stereo", dict(noise="light", atten_lim_db=100.0), np.stack([_speechlike(2, 5, 1), _speechlike(2, 5, 2)], 1)),
-])
-def test_the_measurement_is_not_reused_unless_it_is_exactly_the_cleaning(monkeypatch, tmp_path, what, opts, x):
-    mono = x if x.ndim == 1 else x.mean(axis=1, dtype=np.float32)
-    ran = []
-    for mod in (pipeline.dfn, pipeline.dpdfnet):
-        monkeypatch.setattr(mod, "denoise_array", lambda x, *a, out=None, _m=mod.__name__, **k: ran.append(_m) or out.__setitem__(slice(None), x))
-    heavy = tmp_path / dpdfnet.MODEL_FILE
-    heavy.write_bytes(b"x")
-    stand_in = pipeline.Measured(mono, np.full(len(mono), 0.5, np.float32))
-    y = pipeline.clean_audio(x, "lib", "model", pipeline.CleanOptions(leveling=False, **opts), heavy_model_path=heavy, measured=stand_in)
-    assert ran and not (y == 0.5).any(), what
-
-
-def test_device_reaches_every_stage_that_has_a_gpu_path(monkeypatch, tmp_path):
-    """CleanOptions.device goes to Sidon, AP-BWE and DPDFNet; DeepFilterNet3 has no device."""
-    from scipy.signal import butter, sosfilt
-
-    seen = {}
-    monkeypatch.setattr(pipeline.dfn, "denoise_array", lambda x, *a, out=None, **k: seen.setdefault("dfn", k) and out.__setitem__(slice(None), x))
-    monkeypatch.setattr(pipeline.dpdfnet, "denoise_array", lambda x, *a, out=None, **k: seen.__setitem__("dpdfnet", k["device"]) or out.__setitem__(slice(None), x))
-    monkeypatch.setattr(pipeline.bwe, "available", lambda d: True)
-    monkeypatch.setattr(pipeline.bwe, "extend", lambda y, d, **k: seen.__setitem__("bwe", k["device"]) or y)
-    monkeypatch.setattr(pipeline.restore, "available", lambda d: True)
-    monkeypatch.setattr(pipeline.restore, "restore", lambda x, d, **k: seen.__setitem__("sidon", k["device"]) or x.copy())
-    heavy = tmp_path / dpdfnet.MODEL_FILE
-    heavy.write_bytes(b"x")
-    full = _speechlike(4, 30) + (0.01 * np.random.default_rng(1).standard_normal(4 * SR)).astype(np.float32)
-    phone = sosfilt(butter(10, 3400, fs=SR, output="sos"), full).astype(np.float32)
-
-    def run(x, opts):
-        seen.clear()
-        pipeline.clean_audio(x, "lib", "model", opts, heavy_model_path=heavy, bwe_model_dir=tmp_path, restore_model_dir=tmp_path)
-        return dict(seen)
-
-    assert run(phone, pipeline.CleanOptions(noise="heavy", leveling=False)) == {"dpdfnet": "cpu", "bwe": "cpu"}
-    assert run(phone, pipeline.CleanOptions(noise="heavy", leveling=False, device="cuda")) == {"dpdfnet": "cuda", "bwe": "cuda"}
-    assert run(full, pipeline.CleanOptions(restore_voice=True, leveling=False, device="cuda")) == {"sidon": "cuda"}
-    assert "device" not in run(full, pipeline.CleanOptions(noise="light", leveling=False, device="cuda")).get("dfn", {})
-
-
-def test_band_limited_recordings_get_their_highs_restored_full_band_ones_never(monkeypatch, tmp_path):
-    from scipy.signal import butter, sosfilt
-
-    monkeypatch.setattr(pipeline.dfn, "denoise_array", lambda x, *a, out=None, **k: out.__setitem__(slice(None), x))
-    extended = []
-    monkeypatch.setattr(pipeline.bwe, "available", lambda d: True)
-    monkeypatch.setattr(pipeline.bwe, "extend", lambda y, d, **k: extended.append(k["model"]) or y)
-    full = _speechlike(4, 30) + (0.01 * np.random.default_rng(1).standard_normal(4 * SR)).astype(np.float32)
-    phone = sosfilt(butter(10, 3400, fs=SR, output="sos"), full).astype(np.float32)
-    for x, want in ((full, None), (phone, "8k")):
-        report: dict = {}
-        pipeline.clean_audio(x, "lib", "model", pipeline.CleanOptions(noise="light", leveling=False),
-                             bwe_model_dir=tmp_path, report=report)
-        assert report["highs"] == want
-    assert extended == ["8k"]
-    report = {}
-    pipeline.clean_audio(phone, "lib", "model", pipeline.CleanOptions(noise="light", leveling=False, restore_highs=False),
-                         bwe_model_dir=tmp_path, report=report)
-    assert report["highs"] is None
-
-
-def test_restore_voice_replaces_noise_removal_and_highs(monkeypatch, tmp_path):
-    calls = []
-    monkeypatch.setattr(pipeline.dfn, "denoise_array", lambda x, *a, out=None, **k: calls.append("dfn") or out.__setitem__(slice(None), x))
-    monkeypatch.setattr(pipeline.restore, "restore", lambda x, d, **k: calls.append("sidon") or x.copy())
-    x = _speechlike(2, 10)
-    report: dict = {}
-    with pytest.raises(FileNotFoundError):  # asked for and not installed: an error, never a cheaper chain
-        pipeline.clean_audio(x, "lib", "model", pipeline.CleanOptions(restore_voice=True, leveling=False),
-                             restore_model_dir=tmp_path, report=report)
-    monkeypatch.setattr(pipeline.restore, "available", lambda d: True)
-    y = pipeline.clean_audio(x, "lib", "model", pipeline.CleanOptions(restore_voice=True, leveling=False),
-                             restore_model_dir=tmp_path, report=report)
-    assert calls == ["sidon"] and report == {"noise": "rebuilt", "highs": None} and y.shape == (len(x), 1)
 
 
 def test_channel_plan():
