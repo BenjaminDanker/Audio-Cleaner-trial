@@ -304,7 +304,7 @@ class Studio(QWidget):
             return
         plot = self.timeline.plot
         plot.progress = doc.run_fraction if doc.locked and not doc.saving else None
-        plot.subs_label = {"srt": "SRT", "vtt": "VTT", "txt": "TXT", "embed": "Into the video"}.get(doc.subtitles, "")
+        plot.subs_label = {"srt": "SRT", "vtt": "VTT", "txt": "TXT", "embed": "Embed"}.get(doc.subtitles, "")
         live = doc.stage == "done" and self.preview is not None and self.preview.live
         self.timeline.labels.set_hear(doc.stage == "done", enabled=live, state=self._hear)
         plot.hear_on = dict(self._hear)
@@ -353,11 +353,11 @@ class Studio(QWidget):
             return
         for text, kind in self.note_lines(doc):
             b = Banner()
+            self.notes.addWidget(b)  # (in the screen first: shown without a parent it flashed as a small window of its own)
             find = doc.job is not None and not doc.original.ok and getattr(doc.original, "state", "") == "missing" and "original" in text.lower()
             b.show_message(text, kind, action_text="Find the original…" if find else "")
             b.action.connect(self.findOriginal)
             b._close.hide()
-            self.notes.addWidget(b)
 
     def note_lines(self, doc: Doc) -> list[tuple[str, str]]:
         lines: list[tuple[str, str]] = []
@@ -398,7 +398,8 @@ class Studio(QWidget):
         else:
             s.set_mode("details")
             again = doc.item is not None and doc.item.state in ("failed", "cancelled")
-            s.set_button("Try again" if again else "Start", not problems, "; ".join(problems), "start")
+            total = doc.estimate()[1]  # (the website says what a run costs here; on this computer it is free, so how long it takes)
+            s.set_button(("Try again" if again else "Start") + (f" · {_say_time(total)}" if total > 0 else ""), not problems, "; ".join(problems), "start")
 
     def _fill_details(self, pop: Popover) -> None:
         doc = self.doc
@@ -459,9 +460,20 @@ class Studio(QWidget):
         return engine.default_output_name(doc.path, doc.facts.source(), self.prefs.job_options()) if doc.facts is not None else ""
 
     def _name_typed(self, text: str) -> None:
+        """The box holds the name; the ending is the type picked in the list beside it. An ending typed into the box ("talk.mp3") becomes the type
+        as it is typed (one this file can't be saved as stays, and the hint says so); not when the box is left, which moved the screen under a
+        click on Start."""
         doc = self.doc
         if doc is not None:
-            doc.set_out_name(text, custom=text.strip() != self._usual_name(doc) or doc.is_job)
+            if engine.split_name(text)[1] in engine.ENDING_NAMES:
+                name = text
+            else:  # the type in the list (one the file can't be saved as was typed earlier: the usual one)
+                ok = engine.available_endings(doc.facts.source()) if doc.facts is not None else engine.ENDING_NAMES
+                ending = engine.split_name(doc.out_name)[1] if doc.out_name else ""
+                if ending not in ok:
+                    ending = engine.split_name(self._usual_name(doc))[1]
+                name = text + ending
+            doc.set_out_name(name, custom=name.strip() != self._usual_name(doc) or doc.is_job)
             self._after_output()
 
     def _ending_picked(self, ending: str) -> None:
