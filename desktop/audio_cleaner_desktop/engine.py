@@ -11,6 +11,7 @@ subtitles). Subtitles ("<name>-cleaned.srt" ...) go next to it, or into the vide
 from __future__ import annotations
 
 import dataclasses
+import errno
 import gc
 import logging
 import os
@@ -104,6 +105,7 @@ _PIECE_SECONDS = 300
 _PIECE_SEARCH_SECONDS = 30
 
 SCRATCH_SAFETY = 1.1  # free space wanted in the scratch folder, as a share more than the estimate
+FULL_DISK_BYTES = 32 << 20  # a disk with less free than this is full (what a write that ran out of room leaves)
 STALE_SECONDS = 24 * 3600  # leftovers of a crashed run older than this are swept away
 _WORK_PREFIX = ".acw-work-"
 _LEFTOVER_FILE = re.compile(r"^\.acw-[0-9a-f]{32}\.[A-Za-z0-9]{1,5}$")
@@ -392,6 +394,20 @@ def scratch_root() -> Path | None:
     return None
 
 
+def disk_full_error(e: BaseException, *folders: Path | None) -> OSError | None:
+    """"The disk is full" to raise in place of `e` when a folder the run wrote to has no room left and `e` is a MediaError
+    (FFmpeg only says that it failed, not why); None otherwise. Ask before the files of the failed run are removed."""
+    if not isinstance(e, MediaError):
+        return None
+    for folder in folders:
+        try:
+            if folder is not None and shutil.disk_usage(folder).free < FULL_DISK_BYTES:
+                return OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+        except OSError:
+            pass
+    return None
+
+
 def _work_parent(dest_dir: Path, need_gb: float) -> Path:
     """The folder for this job's work folder: the scratch folder when it has the room, else next to the result."""
     root = scratch_root()
@@ -435,10 +451,34 @@ def _remove_quietly(path: Path) -> None:
         pass
 
 
+def _unfinished_dir() -> Path:
+    return models.app_data_dir() / "unfinished"
+
+
+def note_unfinished(path: Path) -> Path | None:
+    """Write down a temporary result file or work folder that is made beside the person's own files, so that a run
+    that dies hard does not leave it there: sweep_leftovers removes it at the next start, whichever folder it is in.
+    Returns the note for forget_unfinished; None when it could not be written (the sweep by age is what is left)."""
+    try:
+        folder = _unfinished_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        note = folder / f"{os.getpid()}-{uuid.uuid4().hex}"
+        note.write_text(str(path.absolute()), encoding="utf-8")
+        return note
+    except OSError:
+        return None
+
+
+def forget_unfinished(note: Path | None) -> None:
+    if note is not None:
+        _remove_quietly(note)
+
+
 def sweep_leftovers(folders=(), *, now: float | None = None) -> int:
     """Remove what a crashed or killed run left behind: everything in the scratch folder whose process is gone,
-    and ".acw-work-*" folders and ".acw-<id>.<ext>" files older than a day in `folders` (the folders results
-    were written to). Never touches anything else. Returns how many items were removed."""
+    what such a run wrote down (note_unfinished), and ".acw-work-*" folders and ".acw-<id>.<ext>" files older than
+    a day in `folders` (the folders results were written to). Never touches anything else. Returns how many items
+    were removed."""
     now = time.time() if now is None else now
     removed = 0
     root = scratch_root()
@@ -461,6 +501,24 @@ def sweep_leftovers(folders=(), *, now: float | None = None) -> int:
                 if _age(entry, now) >= STALE_SECONDS:
                     _remove_quietly(entry)
                     removed += 1
+    try:
+        notes = list(_unfinished_dir().iterdir())
+    except OSError:
+        notes = []
+    for note in notes:
+        match = re.match(r"^(\d+)-", note.name)
+        if match and _pid_alive(int(match.group(1))):
+            continue  # still being made
+        try:
+            target = Path(note.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            target = None
+        # (only the two kinds of names this app gives its temporary files, whatever the note says)
+        if target is not None and ((target.name.startswith(_WORK_PREFIX) and target.is_dir()) or _LEFTOVER_FILE.match(target.name)):
+            if os.path.lexists(target):
+                _remove_quietly(target)
+                removed += 1
+        _remove_quietly(note)
     return removed
 
 
@@ -663,6 +721,7 @@ def process(
             tmp_out.touch(exist_ok=False)
         except OSError as e:
             raise MediaError(f"Cannot write to the folder {dest_dir}: {e.strerror or e}") from e
+        notes = [note_unfinished(tmp_out)]
     except BaseException:  # refused or stopped before the job began: the folder made for its copies is not needed
         if keep_dir is not None:
             copies.delete_job_dir(Path(keep_dir).parent, Path(keep_dir).name)
@@ -688,6 +747,8 @@ def process(
             dir=_work_parent(dest_dir, estimated_scratch_gb(info.duration, info.audio_channels)),
             prefix=f"{_WORK_PREFIX}{os.getpid()}-",
         ))
+        if work.parent != scratch_root():
+            notes.append(note_unfinished(work))
         try:
             _check_cancel(cancel)
             if keep_dir is not None:
@@ -794,12 +855,15 @@ def process(
         except BaseException as e:
             # A cancelled or failed job's traceback still holds the memory-mapped scratch arrays
             # (in the renderer's frames); Windows can't delete a file that is still mapped.
+            full = disk_full_error(e, work, dest_dir)
             x = y = ref = inputs = None
             traceback.clear_frames(e.__traceback__)
             if keeper is not None:  # stopped: nothing is kept. Failed: what was made before it failed stays (changing it later may still work)
                 keeper.discard() if isinstance(e, Cancelled) else keeper.finish()
             elif keep_dir is not None:  # stopped or failed before the first copy could be made
                 copies.delete_job_dir(Path(keep_dir).parent, Path(keep_dir).name)
+            if full is not None:
+                raise full from e
             raise
         finally:
             x = y = ref = inputs = None
@@ -814,6 +878,8 @@ def process(
                 threading.Thread(target=_remove_work_dir, args=(work,), name="scratch-cleanup", daemon=True).start()
     finally:
         tmp_out.unlink(missing_ok=True)
+        for note in notes:
+            forget_unfinished(note)
     report(1.0)
     kept_here = keeper is not None and keeper.job is not None and bool(keeper.job)
     return JobResult(

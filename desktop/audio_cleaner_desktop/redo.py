@@ -72,6 +72,14 @@ def last_result(job: copies.JobCopies) -> Path | None:
     return None
 
 
+def is_original(job: copies.JobCopies, path: Path) -> bool:
+    """Is `path` the job's original file itself (under any spelling: upper or lower case, a link)?"""
+    try:
+        return os.path.samefile(path, job.original_path)
+    except OSError:  # one of the two is not there
+        return False
+
+
 def result_dir(job: copies.JobCopies, fallback: Path | None = None) -> Path:
     """Where a new result goes: next to the latest one, else next to the original (else `fallback`)."""
     last = last_result(job)
@@ -181,6 +189,9 @@ def plan(
         _, problem = engine.check_output_name(name, source)
         if problem:
             p.problems.append(problem)
+    if name and is_original(job, result_dir(job) / name):
+        # (asking "Replace it?" for this name would offer to put the original in the bin)
+        p.problems.append("That is the name of your original file. Pick another name, so the original stays as it is.")
     elif not name:
         p.problems.append("Type a name for the new file.")
     p.steps.append("Save it as a new file" + (f" ({name})" if name else ""))
@@ -255,6 +266,8 @@ def run(
     threads = threads or engine.worker_threads()
     ff = engine.ffmpeg(threads, cancel)
     src = job.original_path
+    if replace is not None and is_original(job, replace):
+        replace = None  # never the original: the new file keeps a name of its own
 
     check = job.check_original()
     if not check.ok:
@@ -275,6 +288,7 @@ def run(
         tmp_out.touch(exist_ok=False)
     except OSError as e:
         raise MediaError(f"Cannot write to the folder {dest_dir}: {e.strerror or e}") from e
+    notes = [engine.note_unfinished(tmp_out)]  # (so that a run that dies hard does not leave it there: engine.sweep_leftovers)
 
     embed = wanted.subtitles == "embed" and ext in engine._EMBED_ENDINGS
     sub_kind = "srt" if wanted.subtitles == "embed" else wanted.subtitles
@@ -287,6 +301,8 @@ def run(
             dir=engine._work_parent(dest_dir, engine.estimated_scratch_gb(info.duration, info.audio_channels) * 1.5),
             prefix=f"{engine._WORK_PREFIX}{os.getpid()}-",
         ))
+        if work.parent != engine.scratch_root():
+            notes.append(engine.note_unfinished(work))
         try:
             _check_cancel(cancel)
             report(0.02)
@@ -339,8 +355,11 @@ def run(
             editor_job.remember(job, done, decided)
             job.add_save([final, *([sub_final] if sub_final else [])], made)
         except BaseException as e:
+            full = engine.disk_full_error(e, work, dest_dir)
             x = y = inputs = None
             traceback.clear_frames(e.__traceback__)
+            if full is not None:
+                raise full from e
             raise
         finally:
             x = y = inputs = None
@@ -352,6 +371,8 @@ def run(
                 threading.Thread(target=engine._remove_work_dir, args=(work,), name="scratch-cleanup", daemon=True).start()
     finally:
         tmp_out.unlink(missing_ok=True)
+        for note in notes:
+            engine.forget_unfinished(note)
     report(1.0)
     return engine.JobResult(
         final, info.duration, info.has_video, sub_final, embedded=embed and sub_tmp is not None, language=language,
